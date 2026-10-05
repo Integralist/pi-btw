@@ -166,6 +166,7 @@ type BtwSessionRuntime = {
   mode: BtwThreadMode;
   subscriptions: Set<() => void>;
   sideThreadStartIndex: number;
+  parentLeafId?: string | null;
 };
 
 type OverlayRuntime = {
@@ -560,6 +561,115 @@ function formatModelRef(model: Pick<SessionModel, "provider" | "id" | "api">): s
   return `${model.provider}/${model.id} (${model.api})`;
 }
 
+const MAX_PARENT_RECENT_MESSAGES = 25;
+const MAX_PARENT_TOOL_RESULT_CHARS = 1000;
+
+function pruneParentMessage(message: Message, maxToolChars = MAX_PARENT_TOOL_RESULT_CHARS): Message {
+  if (message.role === "toolResult" && Array.isArray(message.content)) {
+    let modified = false;
+    const newContent = message.content.map((part) => {
+      if (part.type === "text" && part.text.length > maxToolChars) {
+        modified = true;
+        return {
+          ...part,
+          text: `${part.text.slice(0, maxToolChars)}\n... [truncated ${part.text.length - maxToolChars} characters for BTW side thread]`,
+        };
+      }
+      return part;
+    });
+    return modified ? { ...message, content: newContent } : message;
+  }
+
+  if (message.role === "assistant" && Array.isArray(message.content)) {
+    const hasThinking = message.content.some((p) => p.type === "thinking");
+    if (hasThinking) {
+      const filtered = message.content.filter((p) => p.type !== "thinking");
+      return {
+        ...message,
+        content: filtered.length > 0 ? filtered : [{ type: "text", text: "(thinking omitted)" }],
+      };
+    }
+  }
+
+  return message;
+}
+
+function cleanTrailingIncompleteTurns(messages: Message[]): Message[] {
+  const result = [...messages];
+  while (result.length > 0) {
+    const last = result[result.length - 1];
+    if (last.role === "assistant" && Array.isArray(last.content) && last.content.some((c) => c.type === "toolCall")) {
+      result.pop();
+    } else {
+      break;
+    }
+  }
+  return result;
+}
+
+function pruneParentMessages(raw: Message[]): Message[] {
+  if (raw.length === 0) {
+    return [];
+  }
+
+  const sanitized = raw.map((msg) => pruneParentMessage(msg));
+
+  if (sanitized.length <= MAX_PARENT_RECENT_MESSAGES) {
+    return cleanTrailingIncompleteTurns(sanitized);
+  }
+
+  const initialGoal: Message[] = [];
+  if (sanitized[0]?.role === "user") {
+    initialGoal.push(sanitized[0]);
+    if (sanitized[1]?.role === "assistant" && !sanitized[1].content.some((c) => c.type === "toolCall")) {
+      initialGoal.push(sanitized[1]);
+    }
+  }
+
+  let recentStart = Math.max(initialGoal.length, sanitized.length - MAX_PARENT_RECENT_MESSAGES);
+  while (recentStart > initialGoal.length && sanitized[recentStart]?.role !== "user") {
+    recentStart--;
+  }
+
+  const recentWindow = sanitized.slice(recentStart);
+  const omittedCount = recentStart - initialGoal.length;
+
+  if (omittedCount > 0) {
+    const separatorMessages: Message[] = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: `[... ${omittedCount} intermediate parent messages omitted to keep BTW responsive ...]`,
+          },
+        ],
+        timestamp: Date.now(),
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Understood. Proceeding with the initial goal and recent context." }],
+        provider: "btw",
+        model: "separator",
+        api: "openai-responses",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      },
+    ];
+    return cleanTrailingIncompleteTurns([...initialGoal, ...separatorMessages, ...recentWindow]);
+  }
+
+  return cleanTrailingIncompleteTurns(sanitized);
+}
+
 function buildBtwSeedState(
   ctx: ExtensionCommandContext,
   thread: BtwDetails[],
@@ -569,28 +679,27 @@ function buildBtwSeedState(
   const messages: Message[] = [];
 
   if (mode === "contextual") {
+    let rawParentMessages: Message[] = [];
     try {
-      messages.push(
-        ...(buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages as Message[]).filter(
-          (message) => !isVisibleBtwMessage(message),
-        ),
+      rawParentMessages = (buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages as Message[]).filter(
+        (message) => !isVisibleBtwMessage(message),
       );
     } catch {
-      messages.push(
-        ...ctx.sessionManager.getEntries().flatMap((entry) => {
-          if (!entry || typeof entry !== "object") {
-            return [];
-          }
+      rawParentMessages = ctx.sessionManager.getEntries().flatMap((entry) => {
+        if (!entry || typeof entry !== "object") {
+          return [];
+        }
 
-          const message = entry as unknown as Partial<Message> & { role?: string; customType?: string; content?: unknown };
-          if (typeof message.role !== "string" || !Array.isArray(message.content)) {
-            return [];
-          }
+        const message = entry as unknown as Partial<Message> & { role?: string; customType?: string; content?: unknown };
+        if (typeof message.role !== "string" || !Array.isArray(message.content)) {
+          return [];
+        }
 
-          return isVisibleBtwMessage({ role: message.role, customType: message.customType }) ? [] : [message as Message];
-        }),
-      );
+        return isVisibleBtwMessage({ role: message.role, customType: message.customType }) ? [] : [message as Message];
+      });
     }
+
+    messages.push(...pruneParentMessages(rawParentMessages));
   }
 
   const sideThreadStartIndex = messages.length;
@@ -2151,7 +2260,8 @@ export default function (pi: ExtensionAPI) {
       session.agent.state.messages = seedMessages as typeof session.state.messages;
     }
 
-    return { session, mode, subscriptions: new Set(), sideThreadStartIndex };
+    const parentLeafId = ctx.sessionManager.getLeafId();
+    return { session, mode, subscriptions: new Set(), sideThreadStartIndex, parentLeafId };
   }
 
   async function ensureBtwSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime | null> {
@@ -2161,6 +2271,14 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (activeBtwSession?.mode === mode) {
+      if (pendingThread.length === 0 && mode === "contextual") {
+        const currentLeafId = ctx.sessionManager.getLeafId();
+        if (activeBtwSession.parentLeafId !== currentLeafId) {
+          await disposeBtwSession();
+          activeBtwSession = await createBtwSubSession(ctx, mode);
+          return activeBtwSession;
+        }
+      }
       return activeBtwSession;
     }
 

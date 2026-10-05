@@ -482,7 +482,7 @@ function createHarness(
 
   const sessionManager = {
     getEntries: () => entries,
-    getLeafId: () => "leaf",
+    getLeafId: () => (entries.length > 0 ? ((entries[entries.length - 1] as any)?.id ?? "leaf") : null),
     getBranch: () => entries,
   };
 
@@ -999,6 +999,158 @@ describe("btw runtime behavior", () => {
     expect(seedTexts).toContain("main session task");
     expect(seedTexts).toContain("main session answer");
     expect(seedTexts).not.toContain("saved btw note");
+  });
+
+  it("prunes long parent context by preserving initial goal, truncating large tool results, and keeping recent window", async () => {
+    const longEntries: SessionEntry[] = [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "text", text: "initial root goal: investigate auth failure" }],
+        timestamp: 1,
+      } as SessionEntry,
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: "Starting investigation." }],
+        timestamp: 2,
+      } as SessionEntry,
+    ];
+
+    // Add 30 intermediate turns with a giant tool result
+    for (let i = 3; i <= 32; i++) {
+      if (i === 28) {
+        // A huge tool result in the recent window
+        longEntries.push({
+          type: "message",
+          role: "toolResult",
+          toolCallId: "call_large",
+          toolName: "read",
+          content: [{ type: "text", text: "X".repeat(5000) }],
+          timestamp: i,
+        } as SessionEntry);
+      } else {
+        longEntries.push({
+          type: "message",
+          role: i % 2 === 1 ? "user" : "assistant",
+          content: [{ type: "text", text: `turn ${i} content` }],
+          timestamp: i,
+        } as SessionEntry);
+      }
+    }
+
+    const harness = createHarness(longEntries);
+    await harness.runSessionStart();
+    await harness.command("btw", "check status");
+
+    const seed = subSessionRecords[0].seedMessages;
+    const allText = seed
+      .map((m) => {
+        const c = m.content;
+        return Array.isArray(c) ? c.map((p: any) => p.text ?? "").join(" ") : String(c);
+      })
+      .join("\n");
+
+    // Initial goal is preserved
+    expect(allText).toContain("initial root goal: investigate auth failure");
+    // Intermediate omission marker is present
+    expect(allText).toContain("intermediate parent messages omitted");
+    // Recent turn is present
+    expect(allText).toContain("turn 32 content");
+    // Giant tool result was truncated
+    expect(allText).toContain("[truncated 4000 characters for BTW side thread]");
+    expect(allText).not.toContain("X".repeat(5000));
+  });
+
+  it("strips thinking blocks from parent assistant messages in BTW seed state", async () => {
+    const harness = createHarness([
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "text", text: "solve this" }],
+        timestamp: 1,
+      } as SessionEntry,
+      {
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "extremely long private thoughts" },
+          { type: "text", text: "here is the conclusion" },
+        ],
+        timestamp: 2,
+      } as SessionEntry,
+    ]);
+
+    await harness.runSessionStart();
+    await harness.command("btw", "aside question");
+
+    const seed = subSessionRecords[0].seedMessages;
+    const assistantMsg = seed.find((m) => m.role === "assistant" && (m.content[0] as any)?.text === "here is the conclusion");
+    expect(assistantMsg).toBeDefined();
+    const hasThinking = (assistantMsg?.content as any[]).some((p) => p.type === "thinking");
+    expect(hasThinking).toBe(false);
+  });
+
+  it("drops trailing unanswered tool calls from parent in-progress turn", async () => {
+    const harness = createHarness([
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "text", text: "run command" }],
+        timestamp: 1,
+      } as SessionEntry,
+      {
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "pending_1", name: "bash", arguments: { command: "sleep 10" } },
+        ],
+        timestamp: 2,
+      } as SessionEntry,
+    ]);
+
+    await harness.runSessionStart();
+    await harness.command("btw", "quick side question");
+
+    const seed = subSessionRecords[0].seedMessages;
+    // Trailing assistant with unanswered tool call should be dropped so LLM APIs don't reject the turn
+    const trailingToolCall = seed.some((m) => m.role === "assistant" && (m.content as any[])?.some((c) => c.type === "toolCall"));
+    expect(trailingToolCall).toBe(false);
+  });
+
+  it("auto-refreshes subsession with new parent context when BTW is opened without prior questions", async () => {
+    const harness = createHarness([
+      {
+        id: "msg_1",
+        type: "message",
+        role: "user",
+        content: [{ type: "text", text: "step 1 from parent" }],
+        timestamp: 1,
+      } as SessionEntry,
+    ]);
+
+    await harness.runSessionStart();
+    // Open BTW initially with no question (seeds with step 1)
+    await harness.command("btw");
+    expect(subSessionRecords).toHaveLength(1);
+    expect(subSessionRecords[0].seedMessages.map((m) => (m.content[0] as any)?.text)).toContain("step 1 from parent");
+
+    // Parent session progresses
+    harness.entries.push({
+      id: "msg_2",
+      type: "message",
+      role: "user",
+      content: [{ type: "text", text: "step 2 from parent" }],
+      timestamp: 2,
+    } as SessionEntry);
+
+    // User now submits a question in BTW without having asked anything before
+    await harness.command("btw", "how is step 2 going?");
+
+    // Should have automatically refreshed to include step 2
+    expect(subSessionRecords).toHaveLength(2);
+    const updatedSeedTexts = subSessionRecords[1].seedMessages.map((m) => (m.content[0] as any)?.text);
+    expect(updatedSeedTexts).toContain("step 2 from parent");
   });
 
   it("switching to tangent recreates the sub-session without inherited main-session context", async () => {
