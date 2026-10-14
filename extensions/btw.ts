@@ -1,12 +1,10 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import {
   buildSessionContext,
   copyToClipboard,
   createAgentSession,
   createExtensionRuntime,
   defineTool,
-  getAgentDir,
+  ModelRuntime,
   SessionManager,
   type AgentSession,
   type AgentSessionEvent,
@@ -17,7 +15,10 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
+  clampThinkingLevel,
   getSupportedThinkingLevels,
+  InMemoryCredentialStore,
+  InMemoryModelsStore,
   Type,
   type AssistantMessage,
   type Message,
@@ -108,18 +109,13 @@ type BtwThinkingOverrideDetails =
   | { timestamp: number; action: "set"; thinkingLevel: SessionThinkingLevel }
   | { timestamp: number; action: "clear" };
 
-type ResolvedBtwModel = {
-  model: SessionModel | null;
-  source: "override" | "main" | "none";
-  configuredOverride: SessionModel | null;
-  fallbackReason?: string;
-};
+type PhysicalPair = { model: SessionModel; thinkingLevel: SessionThinkingLevel };
 
 type ResolvedBtwSettings = {
   model: SessionModel | null;
   modelSource: "override" | "main" | "none";
   configuredModelOverride: SessionModel | null;
-  thinkingLevel: SessionThinkingLevel;
+  thinkingLevel: SessionThinkingLevel | null;
   thinkingSource: "override" | "main";
   fallbackReason?: string;
 };
@@ -167,6 +163,7 @@ type BtwSessionRuntime = {
   subscriptions: Set<() => void>;
   sideThreadStartIndex: number;
   parentLeafId?: string | null;
+  pair: PhysicalPair;
 };
 
 type OverlayRuntime = {
@@ -207,7 +204,9 @@ function createBtwResourceLoader(
     getThemes: () => ({ themes: [], diagnostics: [] }),
     getAgentsFiles: () => ({ agentsFiles: [] }),
     getSystemPrompt: () => systemPrompt,
+    getSystemPromptSource: () => undefined,
     getAppendSystemPrompt: () => appendSystemPrompt,
+    getAppendSystemPromptSources: () => [],
     extendResources: () => {},
     reload: async () => {},
   };
@@ -334,53 +333,96 @@ function normalizeModelBaseUrl(
   return model;
 }
 
-function getAllAvailableModels(ctx: ExtensionCommandContext): SessionModel[] {
-  const models: SessionModel[] = [];
-  const seen = new Set<string>();
+function isPhysicalModel(model: SessionModel | null | undefined): model is SessionModel {
+  return !!model && model.api !== "pi-virtual";
+}
 
-  const add = (m: SessionModel | null | undefined) => {
-    if (!m || !m.provider || !m.id) return;
-    const key = `${m.provider}/${m.id}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      models.push(m);
+function resolvePhysicalParentPair(ctx: ExtensionContext, thinkingLevel: SessionThinkingLevel): PhysicalPair | null {
+  if (isPhysicalModel(ctx.model)) return { model: ctx.model, thinkingLevel };
+  if (!ctx.model) return null;
+
+  for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
+    if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+    const message = entry.message;
+    if (!["stop", "length", "toolUse"].includes(message.stopReason)) continue;
+    if (message.api === "pi-virtual") continue;
+    const model = ctx.modelRegistry.find(message.provider, message.model);
+    const effort: unknown = (message as AssistantMessage & { thinkingLevel?: unknown }).thinkingLevel;
+    // Identity and effort must come from this same successful response, never router state.
+    if (!isPhysicalModel(model) || typeof effort !== "string" ||
+        !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(effort)) return null;
+    return { model, thinkingLevel: effort as SessionThinkingLevel };
+  }
+  return null;
+}
+
+const PHYSICAL_SETTINGS_REQUIRED =
+  "BTW needs a physical model and thinking level. Use /btw --model <provider/id> --thinking <level>; virtual selections cannot run in a BTW child.";
+
+function getAllAvailableModels(ctx: ExtensionCommandContext): SessionModel[] {
+  const models = new Map<string, SessionModel>();
+  for (const model of [ctx.model, ...ctx.modelRegistry.getAll()]) {
+    if (isPhysicalModel(model)) models.set(`${model.provider}/${model.id}`, model);
+  }
+  return [...models.values()];
+}
+
+async function createBtwModelRuntime(ctx: ExtensionCommandContext, model: SessionModel): Promise<ModelRuntime> {
+  if (!isPhysicalModel(model)) throw new Error(PHYSICAL_SETTINGS_REQUIRED);
+  const provider = ctx.modelRegistry.getProvider(model.provider);
+  if (!provider) throw new Error(`No configured provider for BTW model ${formatModelRef(model)}.`);
+  const runtime = await ModelRuntime.create({
+    credentials: new InMemoryCredentialStore(),
+    modelsPath: null,
+    modelsStore: new InMemoryModelsStore(),
+    refreshOnCreate: false,
+    allowModelNetwork: false,
+  });
+  // No default catalog, discovery, ambient auth or virtual routing in this child.
+  for (const builtin of runtime.getProviders()) {
+    const disabled = {
+      id: builtin.id,
+      name: builtin.name,
+      auth: { apiKey: { name: "Unavailable in BTW", resolve: async () => undefined } },
+      getModels: () => [],
+      getAllModels: () => [],
+      stream: () => { throw new Error("Default providers are unavailable in BTW."); },
+      streamSimple: () => { throw new Error("Default providers are unavailable in BTW."); },
+    };
+    runtime.registerNativeProvider(disabled);
+  }
+  const assertChosen = (candidate: SessionModel) => {
+    if (!isPhysicalModel(candidate) || candidate.provider !== model.provider || candidate.id !== model.id || candidate.api !== model.api) {
+      throw new Error(PHYSICAL_SETTINGS_REQUIRED);
     }
   };
-
-  if (ctx.model) {
-    add(ctx.model);
-  }
-
-  const scopedModels = (ctx as any).scopedModels;
-  if (Array.isArray(scopedModels)) {
-    for (const scoped of scopedModels) {
-      add((scoped as any).model ?? scoped);
-    }
-  }
-
-  if (!process.env.VITEST) {
-    try {
-      const storePath = join(getAgentDir(), "models-store.json");
-      if (existsSync(storePath)) {
-        const raw = JSON.parse(readFileSync(storePath, "utf-8"));
-        for (const val of Object.values(raw)) {
-          if (Array.isArray(val)) {
-            for (const m of val) add(m as SessionModel);
-          } else if (val && typeof val === "object" && Array.isArray((val as any).models)) {
-            for (const m of (val as any).models) add(m as SessionModel);
-          }
-        }
-      }
-    } catch {}
-  }
-
-  if (typeof (ctx.modelRegistry as any).getAll === "function") {
-    for (const m of (ctx.modelRegistry as any).getAll()) {
-      add(m);
-    }
-  }
-
-  return models;
+  const physicalProvider = {
+    ...provider,
+    // Resolve on the parent's public auth boundary, not against the empty child store.
+    auth: { apiKey: { name: "Parent session", resolve: async () => {
+      const resolved = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+      if (!resolved.ok) throw new Error(resolved.error);
+      return {
+        auth: { apiKey: resolved.apiKey, headers: resolved.headers, ...(resolved.baseUrl ? { baseUrl: resolved.baseUrl } : {}) },
+        env: resolved.env,
+      };
+    } } },
+    getModels: () => [model],
+    getAllModels: () => [model],
+    refreshModels: undefined,
+    filterModels: () => [model],
+    filterAllModels: () => [model],
+    stream: ((candidate, context, options) => {
+      assertChosen(candidate);
+      return provider.stream(candidate, context, options);
+    }) as typeof provider.stream,
+    streamSimple: ((candidate, context, options) => {
+      assertChosen(candidate);
+      return provider.streamSimple(candidate, context, options);
+    }) as typeof provider.streamSimple,
+  };
+  runtime.registerNativeProvider(physicalProvider);
+  return runtime;
 }
 
 type ModelResolutionResult =
@@ -397,12 +439,18 @@ async function resolveBtwModelQuery(
     return { status: "not_found", error: "No model query provided." };
   }
 
+  const normalized = trimmed.toLowerCase();
+  const exactTarget = [ctx.model, ...ctx.modelRegistry.getAll()].find(
+    (model) => model && `${model.provider}/${model.id}`.toLowerCase() === normalized,
+  );
+  if (exactTarget?.api === "pi-virtual") {
+    return { status: "not_found", error: PHYSICAL_SETTINGS_REQUIRED };
+  }
+
   const allModels = getAllAvailableModels(ctx);
   if (allModels.length === 0) {
     return { status: "not_found", error: `No models available in registry to match "${query}".` };
   }
-
-  const normalized = trimmed.toLowerCase();
 
   // 1. Exact match on provider/id
   const canonicalMatches = allModels.filter(
@@ -470,7 +518,7 @@ async function resolveBtwModelQuery(
   }
 
   if (candidates.length === 0) {
-    return { status: "not_found", error: `No model found matching "${query}".` };
+    return { status: "not_found", error: `No physical model found matching "${query}". ${PHYSICAL_SETTINGS_REQUIRED}` };
   }
 
   // Deduplicate candidates by provider + id
@@ -1840,23 +1888,13 @@ export default function (pi: ExtensionAPI) {
   let pendingModelDisambiguation: ModelDisambiguationState | null = null;
   let pendingSessionDispose = false;
 
-  function getEffectiveModel(): SessionModel | null {
-    return (
-      btwModelOverride ??
-      currentMainModel ??
-      (lastUiContext && "model" in lastUiContext ? (lastUiContext as ExtensionCommandContext).model ?? null : null)
-    );
-  }
-
-  function getEffectiveThinkingLevel(): SessionThinkingLevel {
-    return btwThinkingOverride ?? (pi.getThinkingLevel() as SessionThinkingLevel);
-  }
-
   function getOverlayModelInfo(): string {
-    const model = getEffectiveModel();
-    const thinking = getEffectiveThinkingLevel();
-    const modelLabel = model ? (btwModelOverride ? `${model.provider}/${model.id}` : model.id) : null;
-    return modelLabel ? `${modelLabel} · thinking: ${thinking}` : `thinking: ${thinking}`;
+    const pair = activeBtwSession?.pair;
+    const model = activeBtwSession?.session.model ?? pair?.model;
+    const thinking = activeBtwSession?.session.thinkingLevel ?? pair?.thinkingLevel;
+    if (model && thinking) return `${model.provider}/${model.id} · thinking: ${thinking}`;
+    const requested = btwModelOverride ?? currentMainModel ?? lastUiContext?.model;
+    return requested ? `requested: ${requested.provider}/${requested.id} · pending physical settings` : "physical settings unavailable";
   }
 
   function syncUi(ctx?: ExtensionContext | ExtensionCommandContext): void {
@@ -1994,76 +2032,40 @@ export default function (pi: ExtensionAPI) {
     await disposeBtwSession();
   }
 
-  async function resolveBtwModel(
-    ctx: ExtensionCommandContext,
-    notifyOnFallback = false,
-  ): Promise<ResolvedBtwModel> {
-    if (btwModelOverride) {
-      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(btwModelOverride);
-      if (auth.ok) {
-        const normalized = normalizeModelBaseUrl(btwModelOverride, auth.apiKey, ctx.model);
-        return {
-          model: normalized,
-          source: "override",
-          configuredOverride: btwModelOverride,
-        };
-      }
-
-      const fallbackReason = ctx.model
-        ? `Configured BTW model ${formatModelRef(btwModelOverride)} has no credentials. Falling back to main model ${formatModelRef(
-            ctx.model,
-          )}.`
-        : `Configured BTW model ${formatModelRef(btwModelOverride)} has no credentials, and no main model is active.`;
-      if (notifyOnFallback) {
-        notify(ctx, fallbackReason, "warning");
-      }
-
-      if (ctx.model) {
-        return {
-          model: ctx.model,
-          source: "main",
-          configuredOverride: btwModelOverride,
-          fallbackReason,
-        };
-      }
-
-      return {
-        model: null,
-        source: "none",
-        configuredOverride: btwModelOverride,
-        fallbackReason,
-      };
-    }
-
-    if (ctx.model) {
-      return {
-        model: ctx.model,
-        source: "main",
-        configuredOverride: null,
-      };
-    }
-
-    return {
-      model: null,
-      source: "none",
-      configuredOverride: null,
-    };
-  }
-
   async function resolveBtwSettings(
     ctx: ExtensionCommandContext,
     notifyOnFallback = false,
   ): Promise<ResolvedBtwSettings> {
-    const resolvedModel = await resolveBtwModel(ctx, notifyOnFallback);
-    const thinkingLevel = btwThinkingOverride ?? (pi.getThinkingLevel() as SessionThinkingLevel);
-
+    const parent = resolvePhysicalParentPair(ctx, pi.getThinkingLevel() as SessionThinkingLevel);
+    const unavailable = (reason = PHYSICAL_SETTINGS_REQUIRED): ResolvedBtwSettings => ({
+      model: null, modelSource: "none", configuredModelOverride: btwModelOverride,
+      thinkingLevel: btwThinkingOverride ?? parent?.thinkingLevel ?? null,
+      thinkingSource: btwThinkingOverride ? "override" : "main", fallbackReason: reason,
+    });
+    if (btwModelOverride && !isPhysicalModel(btwModelOverride)) return unavailable();
+    let model = btwModelOverride ?? parent?.model;
+    let thinkingLevel = btwThinkingOverride ?? parent?.thinkingLevel;
+    if (!model || !thinkingLevel) return unavailable();
+    let fallbackReason: string | undefined;
+    let modelSource: "override" | "main" = btwModelOverride ? "override" : "main";
+    if (btwModelOverride) {
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(btwModelOverride);
+      if (auth.ok) {
+        model = normalizeModelBaseUrl(btwModelOverride, auth.apiKey, parent?.model);
+      } else {
+        fallbackReason = parent
+          ? `Configured BTW model ${formatModelRef(btwModelOverride)} has no credentials. Falling back to main model ${formatModelRef(parent.model)}.`
+          : `Configured BTW model ${formatModelRef(btwModelOverride)} has no credentials. ${PHYSICAL_SETTINGS_REQUIRED}`;
+        if (notifyOnFallback) notify(ctx, fallbackReason, "warning");
+        if (!parent) return unavailable(fallbackReason);
+        model = parent.model;
+        thinkingLevel = btwThinkingOverride ?? parent.thinkingLevel;
+        modelSource = "main";
+      }
+    }
     return {
-      model: resolvedModel.model,
-      modelSource: resolvedModel.source,
-      configuredModelOverride: resolvedModel.configuredOverride,
-      thinkingLevel,
-      thinkingSource: btwThinkingOverride ? "override" : "main",
-      fallbackReason: resolvedModel.fallbackReason,
+      model, modelSource, configuredModelOverride: btwModelOverride, thinkingLevel,
+      thinkingSource: btwThinkingOverride ? "override" : "main", fallbackReason,
     };
   }
 
@@ -2088,7 +2090,7 @@ export default function (pi: ExtensionAPI) {
 
   function describeResolvedThinking(settings: ResolvedBtwSettings): string {
     const source = settings.thinkingSource === "override" ? "override" : "inherits main thread";
-    return `BTW thinking: ${settings.thinkingLevel} (${source}).`;
+    return settings.thinkingLevel ? `BTW thinking: ${settings.thinkingLevel} (${source}).` : `BTW thinking unavailable. ${PHYSICAL_SETTINGS_REQUIRED}`;
   }
 
   async function setBtwModelOverride(
@@ -2097,6 +2099,8 @@ export default function (pi: ExtensionAPI) {
     disposeCurrent = true,
   ): Promise<void> {
     if (nextModel) {
+      nextModel = ctx.modelRegistry.find(nextModel.provider, nextModel.id) ?? null;
+      if (!isPhysicalModel(nextModel)) throw new Error(PHYSICAL_SETTINGS_REQUIRED);
       try {
         const auth = await ctx.modelRegistry.getApiKeyAndHeaders(nextModel);
         nextModel = normalizeModelBaseUrl(nextModel, auth.ok ? auth.apiKey : undefined, ctx.model);
@@ -2142,9 +2146,11 @@ export default function (pi: ExtensionAPI) {
 
   async function createBtwSubSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime> {
     const settings = await resolveBtwSettings(ctx, true);
-    if (!settings.model) {
-      throw new Error(settings.fallbackReason || "No active model selected.");
+    if (!settings.model || !settings.thinkingLevel) {
+      throw new Error(settings.fallbackReason || PHYSICAL_SETTINGS_REQUIRED);
     }
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(settings.model);
+    if (!auth.ok) throw new Error(auth.error);
 
     const configureBtwTool: ToolDefinition = defineTool({
       name: "configure_btw",
@@ -2242,34 +2248,30 @@ export default function (pi: ExtensionAPI) {
       },
     });
 
-    const identityPrompt = `You are currently running as model ${formatModelRef(settings.model)} with thinking level ${settings.thinkingLevel}.`;
+    const thinkingLevel = clampThinkingLevel(settings.model, settings.thinkingLevel);
+    const identityPrompt = `You are currently running as model ${formatModelRef(settings.model)} with thinking level ${thinkingLevel}.`;
+    const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode, settings.model);
+    const sessionManager = SessionManager.inMemory(ctx.cwd);
+    for (const message of seedMessages) sessionManager.appendMessage(message);
 
     const { session } = await createAgentSession({
-      sessionManager: SessionManager.inMemory(),
+      cwd: ctx.cwd,
+      sessionManager,
       model: settings.model,
-      modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
-      thinkingLevel: settings.thinkingLevel,
+      modelRuntime: await createBtwModelRuntime(ctx, settings.model),
+      thinkingLevel,
       // Match pi's default coding-agent toolset (read/bash/edit/write) plus configure_btw.
       tools: ["read", "bash", "edit", "write", "configure_btw"],
       customTools: [configureBtwTool],
       resourceLoader: createBtwResourceLoader(ctx, [BTW_SYSTEM_PROMPT, identityPrompt]),
     });
 
-    const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode, settings.model);
-    if (seedMessages.length > 0) {
-      session.agent.state.messages = seedMessages as typeof session.state.messages;
-    }
-
     const parentLeafId = ctx.sessionManager.getLeafId();
-    return { session, mode, subscriptions: new Set(), sideThreadStartIndex, parentLeafId };
+    const pair = { model: session.model ?? settings.model, thinkingLevel: session.thinkingLevel };
+    return { session, mode, subscriptions: new Set(), sideThreadStartIndex, parentLeafId, pair };
   }
 
   async function ensureBtwSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime | null> {
-    const settings = await resolveBtwSettings(ctx);
-    if (!settings.model) {
-      return null;
-    }
-
     if (activeBtwSession?.mode === mode) {
       if (pendingThread.length === 0 && mode === "contextual") {
         const currentLeafId = ctx.sessionManager.getLeafId();
@@ -2787,7 +2789,7 @@ function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?:
         setOverlayDraft("");
         await setBtwThinkingOverride(cmdCtx, (switchIntent.thinking as string) === "clear" ? null : switchIntent.thinking);
         const settings = await resolveBtwSettings(cmdCtx);
-        appendPersistedTranscriptTurn(transcriptState, {
+        if (settings.thinkingLevel) appendPersistedTranscriptTurn(transcriptState, {
           question,
           thinking: "",
           answer: `Switched BTW thinking level to \`${settings.thinkingLevel}\`.`,
@@ -2811,7 +2813,7 @@ function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?:
             await setBtwThinkingOverride(cmdCtx, (switchIntent.thinking as string) === "clear" ? null : switchIntent.thinking);
           }
           const settings = await resolveBtwSettings(cmdCtx);
-          appendPersistedTranscriptTurn(transcriptState, {
+          if (settings.thinkingLevel) appendPersistedTranscriptTurn(transcriptState, {
             question,
             thinking: "",
             answer: `Switched BTW model to \`${formatModelRef(res.model)}\`. It will take effect on your next message.`,
@@ -2838,6 +2840,9 @@ function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?:
           syncUi(cmdCtx);
           return;
         }
+        setOverlayStatus(res.error, cmdCtx);
+        notify(cmdCtx, res.error, "error");
+        return;
       }
     }
 
@@ -2901,7 +2906,9 @@ function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?:
         if (details?.action === "set") {
           const resolved = ctx.modelRegistry.find(details.provider, details.id);
           if (resolved) {
+            // Keep an invalid virtual override visible until explicitly replaced or cleared.
             btwModelOverride = resolved;
+            if (!isPhysicalModel(resolved)) notify(ctx, PHYSICAL_SETTINGS_REQUIRED, "warning");
           } else {
             // Configured override is no longer in the registry; drop it on restore.
             btwModelOverride = null;
@@ -2957,35 +2964,20 @@ function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?:
     mode: BtwThreadMode,
   ): Promise<void> {
     lastUiContext = ctx;
-    const settings = await resolveBtwSettings(ctx);
-    const model = settings.model;
-    if (!model) {
-      const message = settings.fallbackReason || "No active model selected.";
-      setOverlayStatus(message, ctx);
-      notify(ctx, message, "error");
-      return;
-    }
-
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok) {
-      const message = auth.error || `No credentials available for ${model.provider}/${model.id}.`;
+    let sessionRuntime: BtwSessionRuntime | null;
+    try {
+      sessionRuntime = await ensureBtwSession(ctx, mode);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
       setOverlayStatus(message, ctx);
       notify(ctx, message, "error");
       await ensureOverlay(ctx);
       return;
     }
-
-    const sessionRuntime = await ensureBtwSession(ctx, mode);
-    if (!sessionRuntime) {
-      setOverlayStatus("No active model selected.", ctx);
-      notify(ctx, "No active model selected.", "error");
-      return;
-    }
-
+    if (!sessionRuntime) return;
     const session = sessionRuntime.session;
     const wasBusy = !ctx.isIdle();
     pendingMode = mode;
-    const thinkingLevel = settings.thinkingLevel;
 
     setOverlayStatus("⏳ thinking...", ctx);
     await ensureOverlay(ctx);
@@ -3016,10 +3008,10 @@ function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?:
         question,
         thinking,
         answer,
-        provider: model.provider,
-        model: model.id,
-        api: model.api,
-        thinkingLevel,
+        provider: response.provider,
+        model: response.model,
+        api: response.api,
+        thinkingLevel: (response as AssistantMessage & { thinkingLevel?: SessionThinkingLevel }).thinkingLevel ?? session.thinkingLevel,
         timestamp: Date.now(),
         usage: response.usage,
       };
@@ -3059,7 +3051,7 @@ function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?:
   async function getBtwHandoffThread(
     ctx: ExtensionCommandContext,
   ): Promise<{ sessionRuntime: BtwSessionRuntime | null; thread: BtwHandoffExchange[] }> {
-    const sessionRuntime = activeBtwSession ?? (await ensureBtwSession(ctx, pendingMode));
+    const sessionRuntime = activeBtwSession;
     const thread = sessionRuntime ? extractBtwHandoffThread(sessionRuntime) : [];
     const resolvedThread = thread.length > 0 ? thread : getPendingThreadForHandoff();
 
@@ -3071,10 +3063,12 @@ function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?:
   }
 
   async function summarizeThread(ctx: ExtensionCommandContext, thread: BtwHandoffExchange[]): Promise<string> {
-    const settings = await resolveBtwSettings(ctx, true);
+    const settings = activeBtwSession
+      ? { ...activeBtwSession.pair, model: activeBtwSession.session.model ?? activeBtwSession.pair.model, thinkingLevel: activeBtwSession.session.thinkingLevel }
+      : await resolveBtwSettings(ctx, true);
     const model = settings.model;
-    if (!model) {
-      throw new Error(settings.fallbackReason || "No active model selected.");
+    if (!model || !settings.thinkingLevel) {
+      throw new Error("fallbackReason" in settings ? settings.fallbackReason || PHYSICAL_SETTINGS_REQUIRED : PHYSICAL_SETTINGS_REQUIRED);
     }
 
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
@@ -3082,11 +3076,13 @@ function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?:
       throw new Error(auth.error || `No credentials available for ${model.provider}/${model.id}.`);
     }
 
+    const modelRuntime = await createBtwModelRuntime(ctx, model);
     const attemptSummarize = async (thinkingLevel: SessionThinkingLevel): Promise<string> => {
       const { session } = await createAgentSession({
-        sessionManager: SessionManager.inMemory(),
+        cwd: ctx.cwd,
+        sessionManager: SessionManager.inMemory(ctx.cwd),
         model,
-        modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
+        modelRuntime,
         thinkingLevel,
         tools: [],
         resourceLoader: createBtwResourceLoader(ctx, [BTW_SUMMARIZE_SYSTEM_PROMPT]),
