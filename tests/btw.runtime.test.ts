@@ -7,7 +7,10 @@ const { promptStreamMock, createAgentSessionMock, sessionManagerInMemoryMock, su
   promptStreamMock: vi.fn(),
   createAgentSessionMock: vi.fn(),
   copyToClipboardMock: vi.fn(async () => {}),
-  sessionManagerInMemoryMock: vi.fn(() => ({ type: "in-memory-session" })),
+  sessionManagerInMemoryMock: vi.fn(() => ({
+    messages: [] as any[],
+    appendMessage(message: any) { this.messages.push(structuredClone(message)); },
+  })),
   subSessionRecords: [] as Array<{
     options: any;
     session: any;
@@ -24,6 +27,10 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
   return {
     ...actual,
     createAgentSession: createAgentSessionMock,
+    ModelRuntime: { create: vi.fn(async () => ({
+      getProviders: () => [],
+      registerNativeProvider: vi.fn(),
+    })) },
     copyToClipboard: copyToClipboardMock,
     SessionManager: {
       ...actual.SessionManager,
@@ -31,6 +38,12 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
     },
   };
 });
+
+// Legacy fixtures intentionally omit model capabilities; native tests exercise SDK clamping.
+vi.mock("@earendil-works/pi-ai", async () => ({
+  ...await vi.importActual<typeof import("@earendil-works/pi-ai")>("@earendil-works/pi-ai"),
+  clampThinkingLevel: (_model: unknown, level: string) => level,
+}));
 
 type CustomEntry = { type: "custom"; customType: string; data?: unknown };
 type SessionEntry = CustomEntry | { type: string; role?: string; customType?: string; content?: unknown; [key: string]: unknown };
@@ -273,8 +286,8 @@ function buildMockSystemPrompt(options: any): string {
 
 function createMockAgentSession(options: any) {
   const listeners = new Set<(event: any) => void>();
-  let seedMessages: any[] = [];
-  let stateMessages: any[] = [];
+  const seedMessages: any[] = options.sessionManager.messages.map((message: any) => structuredClone(message));
+  let stateMessages: any[] = seedMessages.map((message: any) => structuredClone(message));
   let isStreaming = false;
 
   const emit = (event: any) => {
@@ -299,10 +312,8 @@ function createMockAgentSession(options: any) {
         get messages() {
           return stateMessages;
         },
-        set messages(messages: any[]) {
-          seedMessages = messages.map((message) => structuredClone(message));
-          stateMessages = seedMessages.map((message) => structuredClone(message));
-          record.seedMessages = seedMessages;
+        set messages(_messages: any[]) {
+          throw new Error("Seed canonical SessionManager history before creating the child.");
         },
       },
     },
@@ -316,6 +327,7 @@ function createMockAgentSession(options: any) {
     get model() {
       return options.model;
     },
+    get thinkingLevel() { return options.thinkingLevel; },
     get isStreaming() {
       return isStreaming;
     },
@@ -399,6 +411,9 @@ function createMockAgentSession(options: any) {
         finalMessage = makeAssistantMessage(answer);
       }
 
+      finalMessage = {
+        ...finalMessage, provider: options.model.provider, model: options.model.id, api: options.model.api,
+      };
       if (!assistantStarted) {
         emit({ type: "message_start", message: finalMessage });
       }
@@ -576,10 +591,13 @@ function createHarness(
   btwExtension(api);
 
   const baseCtx = {
+    cwd: process.cwd(),
     hasUI: true,
     ui: ui as any,
     sessionManager: sessionManager as any,
     modelRegistry: {
+      getProvider: vi.fn((id: string) => ({ id, name: id, stream: vi.fn(), streamSimple: vi.fn() })),
+      getProviderAuth: vi.fn(async () => ({ auth: { apiKey: "test-key" } })),
       getApiKeyAndHeaders: vi.fn(async (requestedModel: { provider: string; id: string; api: string }) => {
         if (credentialResolver) {
           const key = credentialResolver(requestedModel);
@@ -717,7 +735,8 @@ describe("btw runtime behavior", () => {
 
     const options = createAgentSessionMock.mock.calls[0][0];
     expect(options.model).toBe(harness.baseCtx.model);
-    expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
+    expect(options.modelRuntime).toBeDefined();
+    expect(options).not.toHaveProperty("modelRegistry");
     expect(options.tools).toEqual(["read", "bash", "edit", "write", "configure_btw"]);
     expect(options.resourceLoader.getAppendSystemPrompt()[0]).toContain(
       "You are having an aside conversation with the user, separate from their main working session.",
@@ -2721,5 +2740,28 @@ describe("btw runtime behavior", () => {
         }
       });
     }
+  });
+});
+
+describe("BTW restored text handoff correction", () => {
+  beforeEach(() => {
+    createAgentSessionMock.mockReset();
+    promptStreamMock.mockReset();
+    subSessionRecords.length = 0;
+  });
+  it.each(["registered", "modal"])("hands off persisted exchanges with unknown physical settings via %s, without a factory or prompt", async (caller) => {
+    const h = createHarness([{ type: "custom", customType: "btw-thread-entry", data: { question: "saved q", thinking: "", answer: "saved a", provider: "test-provider", model: "test-model", api: "openai-responses", thinkingLevel: "high", timestamp: 1 } }]);
+    h.baseCtx.model = { ...h.baseCtx.model, api: "pi-virtual" };
+    await h.runSessionStart();
+    await h.command("btw:summarize");
+    expect(createAgentSessionMock).not.toHaveBeenCalled();
+    expect(h.sentUserMessages).toHaveLength(0);
+    expect(h.notifications.at(-1)?.message).toContain("physical model and thinking level");
+    if (caller === "registered") await h.command("btw:inject");
+    else { h.latestOverlayComponent().input.onSubmit("/inject"); await flushAsyncWork(); }
+    expect(h.sentUserMessages).toEqual([{ content: "Here is a side conversation I had for additional context:\n\nUser: saved q\nAssistant: saved a", options: undefined }]);
+    expect(createAgentSessionMock).not.toHaveBeenCalled();
+    expect(promptStreamMock).not.toHaveBeenCalled();
+    expect(getCustomEntries(h.entries, "btw-thread-reset")).toHaveLength(1);
   });
 });

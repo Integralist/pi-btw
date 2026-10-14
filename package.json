@@ -30,7 +30,8 @@
     "access": "public"
   },
   "scripts": {
-    "test": "vitest --run"
+    "test": "vitest --run",
+    "test:compat": "node tests/btw.host-matrix.mjs"
   },
   "pi": {
     "extensions": [
@@ -42,9 +43,9 @@
     "image": "https://raw.githubusercontent.com/dbachelder/pi-btw/main/docs/btw-overlay.png"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.85.1 <1",
-    "@earendil-works/pi-coding-agent": ">=0.85.1 <1",
-    "@earendil-works/pi-tui": ">=0.85.1 <1"
+    "@earendil-works/pi-ai": ">=0.85.1 <1 || 1.2.0",
+    "@earendil-works/pi-coding-agent": ">=0.85.1 <1 || 1.2.0",
+    "@earendil-works/pi-tui": ">=0.85.1 <1 || 1.2.0"
   },
   "devDependencies": {
     "typescript": "^6.0.2",
