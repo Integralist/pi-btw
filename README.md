@@ -115,7 +115,8 @@ pi install /absolute/path/to/pi-btw
 ### `/btw:summarize [instructions]`
 
 - summarizes the BTW thread with the current effective BTW model
-- always runs summarize with thinking off, even if BTW chat is using a thinking override
+- uses thinking off when the physical model supports it; otherwise uses the
+  active BTW effort, and retries a provider rejection of off with that safe effort
 - injects the summary into the main agent
 - if pi is busy, queues it as a follow-up
 - clears the BTW thread after sending
@@ -173,9 +174,44 @@ BTW is implemented as an actual pi sub-session with its own in-memory session st
 - contextual `/btw` threads seed that sub-session from the current main-session branch while filtering out BTW-visible notes from the parent context
 - `/btw:tangent` starts the same BTW UI in a contextless mode with no inherited main-session conversation
 - BTW can inherit the main thread model/thinking settings or use BTW-only overrides via `--model` and `--thinking` flags or natural language
-- `/btw:summarize` uses the current effective BTW model but keeps thinking off
+- `/btw:summarize` keeps the chosen physical model, using thinking off when
+  supported or the active BTW effort when off is unavailable
 - the overlay transcript/status line is driven from sub-session events, so tool activity, streaming deltas, failures, and recovery are all visible without scraping rendered output
 - handoff commands (`/btw:inject` and `/btw:summarize`) read from the BTW sub-session thread rather than maintaining a separate manual transcript model
+
+### Physical model inheritance
+
+BTW works without a router extension. Compatibility checks cover Pi 0.85.1
+and 1.2.0; the peer declaration adds exactly 1.2.0, not future 1.x versions.
+
+A new BTW child uses the selected physical model and its selected thinking
+level. With a virtual selection, it instead uses the latest successful physical
+assistant response on the active branch, including that response's recorded
+thinking level. Failed or aborted responses and opaque router state are not
+physical-model evidence.
+
+If the physical model or its matching effort cannot be established, supply both:
+
+```text
+/btw --model provider/physical-model --thinking high your question
+```
+
+Only physical models are offered for BTW overrides. Model and thinking overrides
+remain independent: a model override can inherit a known physical effort, but
+an unknown virtual route cannot supply one. A thinking-only override cannot
+establish an unknown physical model. Restored virtual overrides must be replaced
+with a physical override or cleared before use. Missing override credentials
+still fall back to a known physical parent pair, never to a virtual selection.
+
+After a conversation starts, ordinary main-session selection or routing changes
+do not retarget or relabel it. The overlay and saved notes report the physical
+child and its actual SDK-clamped effort. New threads, explicit synchronization,
+and BTW override changes retain their existing recreation behavior.
+
+Children and summaries load no parent extensions or virtual routers. They use
+only their chosen physical catalog model and the parent's configured provider
+transport and public authentication boundary; no separate credentials are copied.
+Summaries keep that physical model on an off-to-safe-effort retry.
 
 ### In-modal slash behavior
 
@@ -243,6 +279,23 @@ To use it without installing:
 ```bash
 pi -e /path/to/pi-btw
 ```
+
+### Offline compatibility checks
+
+Keep the existing development pins. No dependency upgrade or install is required
+for checks against an already available host:
+
+```bash
+npm run test:compat
+PI_BTW_SDK_ROOT=/path/to/pi-host npm run test:compat
+```
+
+The optional host root supplies installed public Pi packages for the test alias;
+it is not a plugin or router dependency. The runner disables Vitest caching and
+config bundling, runs the existing and native caller tests, typechecks the
+extension, and checks the public extension loader. Native virtual cases are
+skipped on hosts without that API. Provider requests use in-memory fixtures only.
+These checks do not verify a fresh package installation or live credentials.
 
 ## License
 
