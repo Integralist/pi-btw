@@ -1264,40 +1264,10 @@ describe("btw runtime behavior", () => {
     expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
   });
 
-  it("dismisses the BTW overlay on app.clear when the composer is empty", async () => {
+  it("stops the active BTW turn on app.clear (Ctrl+C) when the composer is empty without closing the overlay", async () => {
     const harness = createHarness([], {
       keybindingMatches: (_data, id) => id === "app.clear" || id === "tui.select.cancel",
     });
-
-    await harness.runSessionStart();
-    await harness.command("btw", "");
-
-    const overlay = harness.latestOverlayComponent();
-    overlay.input.setValue("");
-    overlay.input.handleInput("\x03");
-    await flushAsyncWork();
-
-    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
-  });
-
-  it("still dismisses the BTW overlay on select cancel", async () => {
-    const harness = createHarness([], {
-      keybindingMatches: (_data, id) => id === "tui.select.cancel",
-    });
-
-    await harness.runSessionStart();
-    await harness.command("btw", "");
-
-    const overlay = harness.latestOverlayComponent();
-    overlay.input.setValue("draft follow-up");
-    overlay.input.handleInput("\x1b");
-    await flushAsyncWork();
-
-    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
-  });
-
-  it("aborts, disposes, and unsubscribes the active BTW sub-session when Escape dismisses mid-stream", async () => {
-    const harness = createHarness();
     const blocking = createBlockingToolStream();
     promptStreamMock.mockImplementation(() => blocking.stream());
 
@@ -1306,6 +1276,60 @@ describe("btw runtime behavior", () => {
     await flushAsyncWork();
 
     const overlay = harness.latestOverlayComponent();
+    const handle = harness.overlayHandles.at(-1);
+    expect(overlay.hintsText.text).toContain("Ctrl+C stop");
+    expect(overlay.hintsText.text).toContain("Esc hide");
+
+    const firstRecord = subSessionRecords[0];
+    expect(firstRecord.getIsStreaming()).toBe(true);
+
+    overlay.input.setValue("");
+    overlay.input.handleInput("\x03");
+    await flushAsyncWork();
+
+    expect(firstRecord.session.abort).toHaveBeenCalledTimes(1);
+    expect(firstRecord.session.dispose).toHaveBeenCalledTimes(1);
+    expect(firstRecord.getIsStreaming()).toBe(false);
+    expect(firstRecord.getListenerCount()).toBe(0);
+    expect(handle?.hideCalls).toBe(0);
+    expect(handle?.isHidden()).toBe(false);
+    expect(overlay.statusText.text).toContain("Request aborted.");
+
+    blocking.release();
+    await pendingCommand;
+  });
+
+  it("hides the BTW overlay on select cancel (Escape) while preserving the draft", async () => {
+    const harness = createHarness([], {
+      keybindingMatches: (_data, id) => id === "tui.select.cancel",
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    const handle = harness.overlayHandles.at(-1);
+    overlay.input.setValue("draft follow-up");
+    overlay.input.handleInput("\x1b");
+    await flushAsyncWork();
+
+    expect(handle?.hideCalls).toBe(0);
+    expect(handle?.isHidden()).toBe(true);
+    expect(handle?.isFocused()).toBe(false);
+    expect(overlay.getDraft()).toBe("draft follow-up");
+  });
+
+  it("hides the BTW overlay on Escape mid-stream while allowing the in-flight turn to finish and reopen via /btw", async () => {
+    const harness = createHarness();
+    const blocking = createBlockingSuccessStream("Finished in background");
+    promptStreamMock.mockImplementation(() => blocking.stream());
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "first question");
+    await flushAsyncWork();
+
+    const overlay = harness.latestOverlayComponent();
+    const handle = harness.overlayHandles.at(-1);
     expect(overlay.statusText.text).toContain("running tool: read");
 
     const firstRecord = subSessionRecords[0];
@@ -1313,17 +1337,62 @@ describe("btw runtime behavior", () => {
     expect(firstRecord.getIsStreaming()).toBe(true);
     expect(firstRecord.getListenerCount()).toBe(1);
 
+    let commandResolved = false;
+    void pendingCommand.then(() => {
+      commandResolved = true;
+    });
+    await flushAsyncWork();
+    expect(commandResolved).toBe(false);
+
     overlay.input.onEscape?.();
     await flushAsyncWork();
 
-    expect(firstRecord.session.abort).toHaveBeenCalledTimes(1);
-    expect(firstRecord.session.dispose).toHaveBeenCalledTimes(1);
-    expect(firstRecord.getIsStreaming()).toBe(false);
-    expect(firstRecord.getListenerCount()).toBe(0);
-    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
+    // Command handler must resolve on Escape so Pi's main InteractiveMode loop can immediately
+    // accept /btw or main-session input while the BTW stream continues in the background.
+    expect(commandResolved).toBe(true);
+    expect(firstRecord.session.abort).not.toHaveBeenCalled();
+    expect(firstRecord.session.dispose).not.toHaveBeenCalled();
+    expect(firstRecord.getIsStreaming()).toBe(true);
+    expect(firstRecord.getListenerCount()).toBe(1);
+    expect(handle?.hideCalls).toBe(0);
+    expect(handle?.isHidden()).toBe(true);
+    expect(handle?.isFocused()).toBe(false);
+
+    // Main session advances while BTW is hidden and still streaming
+    harness.entries.push({
+      id: "main_turn_2",
+      type: "message",
+      role: "user",
+      content: [{ type: "text", text: "main session work" }],
+      timestamp: Date.now(),
+    } as SessionEntry);
+
+    // Reopen with /btw while still streaming -> should not abort in-flight turn
+    await harness.command("btw", "");
+    expect(firstRecord.session.abort).not.toHaveBeenCalled();
+    expect(handle?.isHidden()).toBe(false);
+    expect(handle?.isFocused()).toBe(true);
+
+    // Hide again before completion, then let the background stream finish
+    overlay.input.onEscape?.();
+    expect(handle?.isHidden()).toBe(true);
 
     blocking.release();
     await pendingCommand;
+    await flushAsyncWork();
+
+    expect(harness.notifications.at(-1)?.type).toBe("info");
+    expect(harness.notifications.at(-1)?.message).toContain("╭");
+    expect(harness.notifications.at(-1)?.message).toContain("💬 BTW reply ready · Run /btw or press Alt+/ to view");
+    expect(harness.notifications.at(-1)?.message).toContain("╰");
+
+    // Reopen with /btw to check the completed reply
+    await harness.command("btw", "");
+    expect(harness.overlayHandles).toHaveLength(1);
+    expect(handle?.isHidden()).toBe(false);
+    expect(handle?.isFocused()).toBe(true);
+    expect(transcriptText(overlay)).toContain("Finished in background");
+    expect(overlay.statusText.text).toContain("Ready for a follow-up.");
   });
 
   it("allows main-session input to proceed while the BTW sub-session is streaming", async () => {
@@ -1366,8 +1435,10 @@ describe("btw runtime behavior", () => {
     expect(harness.baseCtx.isIdle()).toBe(true);
   });
 
-  it("ignores late session events after overlay dismissal disposes the sub-session", async () => {
-    const harness = createHarness();
+  it("ignores late session events after Ctrl+C stops and disposes the sub-session", async () => {
+    const harness = createHarness([], {
+      keybindingMatches: (_data, id) => id === "app.clear",
+    });
 
     await harness.runSessionStart();
     await harness.command("btw", "");
@@ -1376,7 +1447,7 @@ describe("btw runtime behavior", () => {
     const firstRecord = subSessionRecords[0];
     expect(firstRecord.getListenerCount()).toBe(1);
 
-    overlay.input.onEscape?.();
+    overlay.input.handleInput("\x03");
     await flushAsyncWork();
 
     expect(firstRecord.session.abort).toHaveBeenCalledTimes(1);
@@ -1386,14 +1457,10 @@ describe("btw runtime behavior", () => {
     firstRecord.emit({ type: "turn_start" });
 
     expect(overlay.getTranscriptEntries()).toEqual([]);
-
-    await harness.command("btw", "");
-    const reopened = harness.latestOverlayComponent();
-    expect(transcriptEntries(reopened)).toEqual([]);
-    expect(transcriptText(reopened)).toContain("No BTW thread yet. Ask a side question to start one.");
+    expect(transcriptText(overlay)).toContain("No BTW thread yet. Ask a side question to start one.");
   });
 
-  it("keeps the thread after Escape dismissal and restores it on reopen", async () => {
+  it("keeps the thread and active session when Escape hides the overlay and reuses the handle on reopen", async () => {
     const harness = createHarness();
     promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
 
@@ -1405,15 +1472,20 @@ describe("btw runtime behavior", () => {
 
     const firstRecord = subSessionRecords[0];
     const overlay = harness.latestOverlayComponent();
+    const handle = harness.overlayHandles[0];
     overlay.input.onEscape?.();
     await flushAsyncWork();
 
-    expect(firstRecord.session.abort).toHaveBeenCalledTimes(1);
-    expect(firstRecord.session.dispose).toHaveBeenCalledTimes(1);
-    expect(firstRecord.getListenerCount()).toBe(0);
+    expect(firstRecord.session.abort).not.toHaveBeenCalled();
+    expect(firstRecord.session.dispose).not.toHaveBeenCalled();
+    expect(firstRecord.getListenerCount()).toBe(1);
+    expect(handle.isHidden()).toBe(true);
+    expect(handle.isFocused()).toBe(false);
 
     await harness.command("btw", "");
-    expect(harness.overlayHandles).toHaveLength(2);
+    expect(harness.overlayHandles).toHaveLength(1);
+    expect(handle.isHidden()).toBe(false);
+    expect(handle.isFocused()).toBe(true);
 
     const reopened = harness.latestOverlayComponent();
     const transcript = transcriptText(reopened);
@@ -1421,6 +1493,32 @@ describe("btw runtime behavior", () => {
     expect(transcript).toContain("Assistant");
     expect(transcript).toContain("First answer");
     expect(reopened.statusText.text).toContain("Ready for a follow-up");
+  });
+
+  it("renders Markdown syntax in assistant transcript entries using the active theme", async () => {
+    const harness = createHarness([], {
+      theme: {
+        fg: (name: string, text: string) => `<fg:${name}>${text}</fg:${name}>`,
+        bg: (name: string, text: string) => `<bg:${name}>${text}</bg:${name}>`,
+        italic: (text: string) => `<italic>${text}</italic>`,
+        bold: (text: string) => `<bold>${text}</bold>`,
+      },
+    });
+    promptStreamMock.mockImplementation(() =>
+      streamAnswer(
+        "- **`conversation_id`** – the conversation ID.\n\nSee [assistant.go:277](file:///tmp/assistant.go).",
+      ),
+    );
+
+    await harness.runSessionStart();
+    await harness.command("btw", "explain the ids");
+
+    const overlay = harness.latestOverlayComponent();
+    const transcript = transcriptText(overlay);
+    expect(transcript).toContain("<fg:mdListBullet>- </fg:mdListBullet>");
+    expect(transcript).toContain("<bold><fg:mdCode>conversation_id</fg:mdCode></bold>");
+    expect(transcript).toContain("<fg:mdLink>assistant.go:277</fg:mdLink>");
+    expect(transcript).not.toContain("**`conversation_id`**");
   });
 
   it("supports an in-place follow-up and preserves both turns in one thread", async () => {
@@ -2451,7 +2549,8 @@ describe("btw runtime behavior", () => {
 
     expect(harness.sentUserMessages).toHaveLength(0);
     expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(2);
-    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
+    expect(harness.overlayHandles.at(-1)?.isHidden()).toBe(true);
   });
 
   it("context filtering excludes BTW notes from main-session context while leaving non-BTW messages intact", async () => {
