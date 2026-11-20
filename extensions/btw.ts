@@ -1,3 +1,7 @@
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 import {
   buildSessionContext,
   copyToClipboard,
@@ -7,6 +11,7 @@ import {
   highlightCode,
   ModelRuntime,
   SessionManager,
+  SettingsManager,
   type AgentSession,
   type AgentSessionEvent,
   type ExtensionAPI,
@@ -28,8 +33,9 @@ import {
 } from "@earendil-works/pi-ai";
 import {
   Box,
+  CombinedAutocompleteProvider,
   Container,
-  Input,
+  Editor,
   Key,
   Markdown,
   Text,
@@ -37,10 +43,12 @@ import {
   truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
+  type EditorTheme,
   type Focusable,
   type KeybindingsManager,
   type MarkdownTheme,
   type OverlayHandle,
+  type SlashCommand,
   type TUI,
 } from "@earendil-works/pi-tui";
 
@@ -131,6 +139,74 @@ type ModelDisambiguationState = {
   mode: BtwThreadMode;
 };
 
+type ThinkingSelectionState = {
+  model: SessionModel;
+  levels: SessionThinkingLevel[];
+  activeLevel: SessionThinkingLevel;
+};
+
+const ALL_THINKING_LEVELS: readonly SessionThinkingLevel[] = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+const GOOGLE_SUPPORTED_MAPPED_LEVELS = new Set(["minimal", "low", "medium", "high"]);
+
+function getEffectiveSupportedThinkingLevels(model: SessionModel): SessionThinkingLevel[] {
+  const base = getSupportedThinkingLevels(model) as SessionThinkingLevel[];
+  if (model.api !== "google-vertex" && model.api !== "google-generative-ai") {
+    return base;
+  }
+
+  const thinkingLevelMap = (model as SessionModel & { thinkingLevelMap?: Record<string, string | null | undefined> })
+    .thinkingLevelMap;
+  return base.filter((level) => {
+    if (level === "off") {
+      return true;
+    }
+    const mapped = thinkingLevelMap?.[level];
+    const resolved = typeof mapped === "string" ? mapped.toLowerCase() : level;
+    return GOOGLE_SUPPORTED_MAPPED_LEVELS.has(resolved);
+  });
+}
+
+function clampBtwThinkingLevel(model: SessionModel, level: SessionThinkingLevel): SessionThinkingLevel {
+  const sdkClamped = clampThinkingLevel(model, level as AiThinkingLevel) as SessionThinkingLevel;
+  if (model.api !== "google-vertex" && model.api !== "google-generative-ai") {
+    return sdkClamped;
+  }
+
+  const supported = getEffectiveSupportedThinkingLevels(model);
+  if (supported.includes(sdkClamped)) {
+    return sdkClamped;
+  }
+
+  const requestedIndex = ALL_THINKING_LEVELS.indexOf(sdkClamped);
+  if (requestedIndex !== -1) {
+    if (sdkClamped !== "off") {
+      for (let i = requestedIndex - 1; i >= 0; i--) {
+        const candidate = ALL_THINKING_LEVELS[i];
+        if (supported.includes(candidate)) {
+          return candidate;
+        }
+      }
+    }
+    for (let i = requestedIndex + 1; i < ALL_THINKING_LEVELS.length; i++) {
+      const candidate = ALL_THINKING_LEVELS[i];
+      if (supported.includes(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  return sdkClamped;
+}
+
 type BtwTranscriptEntry =
   | { id: number; turnId: number; type: "turn-boundary"; phase: "start" | "end" }
   | { id: number; turnId: number; type: "user-message"; text: string }
@@ -177,6 +253,99 @@ type OverlayRuntime = {
   setDraft?: (value: string) => void;
   closed?: boolean;
 };
+
+type BtwContextUsageInfo = {
+  text: string;
+  level: "normal" | "warning" | "error";
+};
+
+type BtwSkillCommand = {
+  name: string;
+  skillName: string;
+  description?: string;
+  filePath: string;
+  baseDir: string;
+};
+
+type BtwAutocompleteConfig = {
+  getCommands: () => SlashCommand[];
+  basePath: string;
+  fdPath: string | null;
+};
+
+function formatTokenCount(count: number): string {
+  if (count < 1000) return String(Math.round(count));
+  if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+  if (count < 1000000) return `${Math.round(count / 1000)}k`;
+  if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
+  return `${Math.round(count / 1000000)}M`;
+}
+
+let cachedFdPath: string | null | undefined;
+function resolveFdPath(): string | null {
+  if (cachedFdPath !== undefined) return cachedFdPath;
+  const managedFd = path.join(homedir(), ".pi", "agent", "bin", process.platform === "win32" ? "fd.exe" : "fd");
+  if (existsSync(managedFd)) {
+    cachedFdPath = managedFd;
+    return cachedFdPath;
+  }
+  try {
+    const cmd = process.platform === "win32" ? "where" : "which";
+    const resolved = execFileSync(cmd, ["fd"], { encoding: "utf8", timeout: 1000, stdio: ["ignore", "pipe", "ignore"] })
+      .split(/\r?\n/)[0]
+      ?.trim();
+    cachedFdPath = resolved || null;
+  } catch {
+    cachedFdPath = null;
+  }
+  return cachedFdPath;
+}
+
+function getBtwSkillCommands(pi: ExtensionAPI): BtwSkillCommand[] {
+  const commands = typeof pi.getCommands === "function" ? pi.getCommands() : [];
+  const skills: BtwSkillCommand[] = [];
+  for (const cmd of commands) {
+    if (cmd.source !== "skill" || !cmd.sourceInfo?.path) continue;
+    const skillName = cmd.name.startsWith("skill:") ? cmd.name.slice(6) : cmd.name;
+    skills.push({
+      name: cmd.name,
+      skillName,
+      description: cmd.description,
+      filePath: cmd.sourceInfo.path,
+      baseDir: cmd.sourceInfo.baseDir ?? path.dirname(cmd.sourceInfo.path),
+    });
+  }
+  return skills;
+}
+
+function stripSkillFrontmatter(content: string): string {
+  return content.replace(/^(?:\uFEFF)?---\r?\n[\s\S]*?\r?\n---\r?\n?/u, "").trim();
+}
+
+function expandBtwSkillCommand(text: string, skills: BtwSkillCommand[]): string {
+  if (!text.startsWith("/skill:")) return text;
+  const spaceIndex = text.indexOf(" ");
+  const skillName = spaceIndex === -1 ? text.slice(7) : text.slice(7, spaceIndex);
+  const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
+  const skill = skills.find((item) => item.skillName === skillName);
+  if (!skill) return text;
+  try {
+    const body = stripSkillFrontmatter(readFileSync(skill.filePath, "utf8"));
+    const skillBlock = `<skill name="${skill.skillName}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
+    return args ? `${skillBlock}\n\n${args}` : skillBlock;
+  } catch {
+    return text;
+  }
+}
+
+function formatUserTranscriptText(text: string): string {
+  const match = text.match(
+    /^<skill name="([^"]+)" location="[^"]+">\nReferences are relative to [^\n]*\n\n[\s\S]*?<\/skill>(?:\n\n([\s\S]*))?$/,
+  );
+  if (!match) return text;
+  const [, skillName, args] = match;
+  return args?.trim() ? `/skill:${skillName} ${args.trim()}` : `/skill:${skillName}`;
+}
 
 function isVisibleBtwMessage(message: { role: string; customType?: string }): boolean {
   return message.role === "custom" && message.customType === BTW_MESSAGE_TYPE;
@@ -370,6 +539,72 @@ function getAllAvailableModels(ctx: ExtensionCommandContext): SessionModel[] {
   return [...models.values()];
 }
 
+function stripModelThinkingSuffix(pattern: string): string {
+  return pattern.replace(/:(?:off|minimal|low|medium|high|xhigh|max)$/i, "");
+}
+
+function matchesEnabledModelPattern(model: SessionModel, rawPattern: string): boolean {
+  const pattern = stripModelThinkingSuffix(rawPattern.trim());
+  if (!pattern) return false;
+
+  const fullId = `${model.provider}/${model.id}`;
+  if (pattern.includes("*") || pattern.includes("?") || pattern.includes("[")) {
+    const regexSource = pattern
+      .replace(/[.+^${}()|\\]/g, "\\$&")
+      .replace(/\*/g, ".*")
+      .replace(/\?/g, ".");
+    const re = new RegExp(`^${regexSource}$`, "i");
+    return re.test(fullId) || (!pattern.includes("/") && re.test(model.id));
+  }
+
+  const lower = pattern.toLowerCase();
+  if (lower.includes("/")) {
+    return fullId.toLowerCase() === lower;
+  }
+  return model.id.toLowerCase() === lower;
+}
+
+function getEnabledModelPatterns(cwd: string): string[] | undefined {
+  if (process.env.VITEST && !process.env.PI_CODING_AGENT_DIR) {
+    return undefined;
+  }
+  try {
+    if (typeof SettingsManager?.create !== "function") {
+      return undefined;
+    }
+    const settings = SettingsManager.create(cwd, process.env.PI_CODING_AGENT_DIR);
+    const patterns = settings.getEnabledModels();
+    return Array.isArray(patterns) && patterns.length > 0 ? patterns : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function getEnabledAvailableModels(ctx: ExtensionCommandContext): {
+  models: SessionModel[];
+  filteredByEnabledModels: boolean;
+} {
+  const allModels = getAllAvailableModels(ctx);
+  const patterns = getEnabledModelPatterns(ctx.cwd);
+  if (!patterns) {
+    return { models: allModels, filteredByEnabledModels: false };
+  }
+
+  const seen = new Set<string>();
+  const matched: SessionModel[] = [];
+  for (const pattern of patterns) {
+    for (const model of allModels) {
+      if (!matchesEnabledModelPattern(model, pattern)) continue;
+      const key = `${model.provider}/${model.id}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        matched.push(model);
+      }
+    }
+  }
+  return { models: matched, filteredByEnabledModels: true };
+}
+
 async function createBtwModelRuntime(ctx: ExtensionCommandContext, model: SessionModel): Promise<ModelRuntime> {
   if (!isPhysicalModel(model)) throw new Error(PHYSICAL_SETTINGS_REQUIRED);
   const provider = ctx.modelRegistry.getProvider(model.provider);
@@ -436,6 +671,7 @@ type ModelResolutionResult =
 async function resolveBtwModelQuery(
   ctx: ExtensionCommandContext,
   query: string,
+  modelPool?: SessionModel[],
 ): Promise<ModelResolutionResult> {
   const trimmed = query.trim();
   if (!trimmed) {
@@ -450,9 +686,14 @@ async function resolveBtwModelQuery(
     return { status: "not_found", error: PHYSICAL_SETTINGS_REQUIRED };
   }
 
-  const allModels = getAllAvailableModels(ctx);
+  const allModels = modelPool ?? getAllAvailableModels(ctx);
   if (allModels.length === 0) {
-    return { status: "not_found", error: `No models available in registry to match "${query}".` };
+    return {
+      status: "not_found",
+      error: modelPool
+        ? `No enabled physical models match "${query}".`
+        : `No models available in registry to match "${query}".`,
+    };
   }
 
   // 1. Exact match on provider/id
@@ -561,7 +802,7 @@ async function resolveBtwModelQuery(
     deduped.map(async (m) => {
       try {
         const res = await ctx.modelRegistry.getApiKeyAndHeaders(m);
-        return res.ok && res.apiKey !== undefined;
+        return res.ok;
       } catch {
         return false;
       }
@@ -1355,7 +1596,7 @@ function buildOverlayTranscript(
     }
 
     if (entry.type === "user-message") {
-      pushInlineBlock(userBadge, entry.text, { blankBefore: false });
+      pushInlineBlock(userBadge, formatUserTranscriptText(entry.text), { blankBefore: false });
       hasContentSinceSeparator = true;
       continue;
     }
@@ -1542,8 +1783,8 @@ function formatHiddenReplyNotification(theme: ExtensionContext["ui"]["theme"]): 
   return `${top}\n${mid}\n${bottom}`;
 }
 
-/** Fixed overlay rows outside the transcript viewport (must match render() structure). */
-const BTW_OVERLAY_CHROME_LINES = 9;
+/** Fixed overlay rows outside the transcript viewport and composer lines. */
+const BTW_OVERLAY_CHROME_LINES = 8;
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -1552,6 +1793,8 @@ function isActiveStatus(status: string | null): boolean {
   return (
     status.includes("running tool") ||
     status.includes("thinking") ||
+    status.includes("compacting") ||
+    status.includes("retrying") ||
     status.includes("generating") ||
     status.includes("resolving") ||
     status.includes("switching") ||
@@ -1573,8 +1816,33 @@ function buildTranscriptBadge(
   return theme.bg(background, theme.fg(foreground, theme.bold(` ${label} `)));
 }
 
+function buildOverlayEditorTheme(theme: ExtensionContext["ui"]["theme"]): EditorTheme {
+  return {
+    borderColor: (str: string) => theme.fg("borderMuted", str),
+    selectList: {
+      selectedPrefix: (text: string) => theme.fg("accent", text),
+      selectedText: (text: string) => theme.fg("accent", text),
+      description: (text: string) => theme.fg("muted", text),
+      scrollInfo: (text: string) => theme.fg("dim", text),
+      noMatch: (text: string) => theme.fg("warning", text),
+    },
+  };
+}
+
+function createEditorTuiProxy(tui: TUI): TUI {
+  return new Proxy(tui, {
+    get(target, prop, receiver) {
+      if (prop === "terminal" && !target.terminal) {
+        return { rows: process.stdout.rows ?? 30 };
+      }
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 class BtwOverlayComponent extends Container implements Focusable {
-  private readonly input: Input;
+  private readonly input: Editor;
   private readonly transcript: Container;
   private readonly statusText: Text;
   private readonly modeText: Text;
@@ -1586,6 +1854,9 @@ class BtwOverlayComponent extends Container implements Focusable {
   private readonly getDebug: () => boolean;
   private readonly getModelInfo: () => string;
   private readonly getDisambiguation?: () => ModelDisambiguationState | null;
+  private readonly getThinkingSelection?: () => ThinkingSelectionState | null;
+  private readonly getContextUsage?: () => BtwContextUsageInfo | null;
+  private readonly autocompleteConfig?: BtwAutocompleteConfig;
   private readonly onSubmitCallback: (value: string) => void;
   private readonly onDismissCallback: () => void;
   private readonly onStopCallback: () => void;
@@ -1594,6 +1865,7 @@ class BtwOverlayComponent extends Container implements Focusable {
   private readonly theme: ExtensionContext["ui"]["theme"];
   private transcriptLines: string[] = [];
   private lastContentWidth = 100;
+  private lastAutocompleteKey = "";
   private transcriptScrollOffset = 0;
   private transcriptViewportHeight = 8;
   private followTranscript = true;
@@ -1629,6 +1901,9 @@ class BtwOverlayComponent extends Container implements Focusable {
     onUnfocus: () => void,
     getDisambiguation?: () => ModelDisambiguationState | null,
     onStop?: () => void,
+    getContextUsage?: () => BtwContextUsageInfo | null,
+    autocompleteConfig?: BtwAutocompleteConfig,
+    getThinkingSelection?: () => ThinkingSelectionState | null,
   ) {
     super();
     this.tui = tui;
@@ -1639,6 +1914,9 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.getDebug = getDebug;
     this.getModelInfo = getModelInfo;
     this.getDisambiguation = getDisambiguation;
+    this.getThinkingSelection = getThinkingSelection;
+    this.getContextUsage = getContextUsage;
+    this.autocompleteConfig = autocompleteConfig;
     this.onSubmitCallback = onSubmit;
     this.onDismissCallback = onDismiss;
     this.onStopCallback = onStop ?? onDismiss;
@@ -1649,13 +1927,16 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.transcript = new Container();
     this.statusText = new Text("", 1, 0);
 
-    this.input = new Input();
+    this.input = new Editor(createEditorTuiProxy(tui), buildOverlayEditorTheme(theme), {
+      paddingX: 0,
+      autocompleteMaxVisible: 5,
+    });
     this.input.onSubmit = (value) => {
+      if (value.trim()) {
+        this.input.addToHistory?.(value.trim());
+      }
       this.followTranscript = true;
       this.onSubmitCallback(value);
-    };
-    this.input.onEscape = () => {
-      this.onDismissCallback();
     };
 
     this.hintsText = new Text("", 1, 0);
@@ -1663,8 +1944,8 @@ class BtwOverlayComponent extends Container implements Focusable {
     const originalHandleInput = this.input.handleInput.bind(this.input);
     this.input.handleInput = (data: string) => {
       if (keybindings.matches(data, "app.clear") || matchesKey(data, Key.ctrl("c"))) {
-        if (this.input.getValue().length > 0) {
-          this.input.setValue("");
+        if (this.input.getText().length > 0) {
+          this.input.setText("");
           this.tui.requestRender();
           return;
         }
@@ -1674,13 +1955,34 @@ class BtwOverlayComponent extends Container implements Focusable {
       }
 
       if (keybindings.matches(data, "tui.select.cancel") || matchesKey(data, Key.escape)) {
+        if (this.input.isShowingAutocomplete?.()) {
+          originalHandleInput(data);
+          this.tui.requestRender();
+          return;
+        }
         this.onDismissCallback();
         return;
       }
       originalHandleInput(data);
     };
 
+    this.refreshAutocomplete();
     this.refresh();
+  }
+
+  private refreshAutocomplete(): void {
+    if (!this.autocompleteConfig || typeof this.input.setAutocompleteProvider !== "function") {
+      return;
+    }
+    const commands = this.autocompleteConfig.getCommands();
+    const key = commands.map((c) => `${c.name}:${c.description ?? ""}`).join("\n");
+    if (key === this.lastAutocompleteKey && this.lastAutocompleteKey !== "") {
+      return;
+    }
+    this.lastAutocompleteKey = key;
+    this.input.setAutocompleteProvider(
+      new CombinedAutocompleteProvider(commands, this.autocompleteConfig.basePath, this.autocompleteConfig.fdPath),
+    );
   }
 
   private frameLine(content: string, innerWidth: number, padX = 2): string {
@@ -1771,13 +2073,13 @@ class BtwOverlayComponent extends Container implements Focusable {
       return;
     }
 
-    if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.up)) {
+    if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.shift("up"))) {
       const step = matchesKey(data, Key.pageUp) ? Math.max(1, this.transcriptViewportHeight - 1) : 1;
       this.scrollTranscript(-step);
       return;
     }
 
-    if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.down)) {
+    if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.shift("down"))) {
       const step = matchesKey(data, Key.pageDown) ? Math.max(1, this.transcriptViewportHeight - 1) : 1;
       this.scrollTranscript(step);
       return;
@@ -1786,22 +2088,25 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.input.handleInput(data);
   }
 
-  private inputFrameLine(dialogWidth: number, padX = 2): string {
+  private renderEditorFrameLines(dialogWidth: number, padX = 2): string[] {
     const innerWidth = Math.max(1, dialogWidth - 2);
     const contentWidth = Math.max(1, innerWidth - padX * 2);
     const previousFocused = this.input.focused;
-    // Input.render() emits CURSOR_MARKER when focused. In overlay mode that APC marker
-    // can skew width/composition on this one row before the TUI strips it, producing a
-    // right-edge notch and shifted border. Render the embedded input unfocused here so
-    // the row stays geometrically stable while the overlay still owns keyboard input.
+    // Editor.render() emits CURSOR_MARKER when focused. In overlay mode that APC marker
+    // can skew width/composition on the cursor row before the TUI strips it, producing a
+    // right-edge notch and shifted border. Render the embedded editor unfocused here so
+    // rows stay geometrically stable while the overlay still owns keyboard input.
     this.input.focused = false;
     try {
-      const renderedInputLine = this.input.render(contentWidth)[0] ?? "";
-      const inputLine = truncateToWidth(renderedInputLine, contentWidth, "");
-      const padding = Math.max(0, contentWidth - visibleWidth(inputLine));
-      const leftMargin = " ".repeat(padX);
-      const rightMargin = " ".repeat(padX + padding);
-      return `${this.theme.fg("border", "│")}${leftMargin}${inputLine}${rightMargin}${this.theme.fg("border", "│")}`;
+      const renderedLines = this.input.render(contentWidth);
+      const linesToFrame = renderedLines.length > 0 ? renderedLines : [""];
+      return linesToFrame.map((rawLine) => {
+        const inputLine = truncateToWidth(rawLine, contentWidth, "");
+        const padding = Math.max(0, contentWidth - visibleWidth(inputLine));
+        const leftMargin = " ".repeat(padX);
+        const rightMargin = " ".repeat(padX + padding);
+        return `${this.theme.fg("border", "│")}${leftMargin}${inputLine}${rightMargin}${this.theme.fg("border", "│")}`;
+      });
     } finally {
       this.input.focused = previousFocused;
     }
@@ -1811,18 +2116,57 @@ class BtwOverlayComponent extends Container implements Focusable {
     return visibleWidth(line) > width ? truncateToWidth(line, width, "") : line;
   }
 
+  private getOverlayBgWrap(): { open: string; close: string } | null {
+    const themeWithAnsi = this.theme as ExtensionContext["ui"]["theme"] & { getBgAnsi?: (color: "toolPendingBg") => string };
+    if (typeof themeWithAnsi.getBgAnsi === "function") {
+      const open = themeWithAnsi.getBgAnsi("toolPendingBg");
+      return open ? { open, close: "\x1b[49m" } : null;
+    }
+    const probe = this.theme.bg("toolPendingBg", "\u0000");
+    const markerIndex = probe.indexOf("\u0000");
+    if (markerIndex <= 0) {
+      return null;
+    }
+    const open = probe.slice(0, markerIndex);
+    const close = probe.slice(markerIndex + 1) || "\x1b[49m";
+    return { open, close };
+  }
+
+  private applyOverlayBackground(line: string, width: number): string {
+    const bgWrap = this.getOverlayBgWrap();
+    if (!bgWrap) {
+      return line;
+    }
+
+    const padding = " ".repeat(Math.max(0, width - visibleWidth(line)));
+    const body = `${line}${padding}`;
+    const reapplied = bgWrap.open.includes("\x1b")
+      ? body.replace(/\x1b\[([0-9;]*)m/g, (seq, params: string) => {
+          const codes = params === "" ? ["0"] : params.split(";");
+          const resetsBg = codes.some((code) => code === "0" || code === "49");
+          return resetsBg ? `${seq}${bgWrap.open}` : seq;
+        })
+      : body;
+    return `${bgWrap.open}${reapplied}${bgWrap.close}`;
+  }
+
   override render(width: number): string[] {
     const dialogWidth = Math.max(24, width);
     const innerWidth = Math.max(22, dialogWidth - 2);
     const contentWidth = Math.max(1, innerWidth - 4);
     if (this.lastContentWidth !== contentWidth) {
       this.lastContentWidth = contentWidth;
-      this.rebuildTranscriptLines(this.readTranscriptEntries(), this.getDisambiguation?.());
+      this.rebuildTranscriptLines(
+        this.readTranscriptEntries(),
+        this.getDisambiguation?.(),
+        this.getThinkingSelection?.(),
+      );
     }
     const transcriptLines = this.wrapTranscript(innerWidth);
+    const editorLines = this.renderEditorFrameLines(dialogWidth);
     const dialogHeight = this.getDialogHeight();
-    const chromeHeight = BTW_OVERLAY_CHROME_LINES;
-    const transcriptHeight = Math.max(6, dialogHeight - chromeHeight);
+    const chromeHeight = BTW_OVERLAY_CHROME_LINES + editorLines.length;
+    const transcriptHeight = Math.max(4, dialogHeight - chromeHeight);
     this.transcriptViewportHeight = transcriptHeight;
 
     const maxScroll = Math.max(0, transcriptLines.length - transcriptHeight);
@@ -1842,15 +2186,23 @@ class BtwOverlayComponent extends Container implements Focusable {
     const transcriptPadCount = Math.max(0, transcriptHeight - visibleTranscript.length);
     const hiddenAbove = this.transcriptScrollOffset;
     const hiddenBelow = Math.max(0, maxScroll - this.transcriptScrollOffset);
-    const summary =
+    const baseSummary =
       hiddenAbove || hiddenBelow
         ? `${this.summaryTextValue.trim()} · ↑${hiddenAbove} ↓${hiddenBelow}`
         : this.summaryTextValue.trim();
+    const ctxUsage = this.getContextUsage?.();
+    const formattedCtxUsage = ctxUsage
+      ? this.theme.fg(
+          ctxUsage.level === "error" ? "error" : ctxUsage.level === "warning" ? "warning" : "dim",
+          ` · ${ctxUsage.text}`,
+        )
+      : "";
+    const summaryLineContent = `${this.theme.fg("dim", baseSummary)}${formattedCtxUsage}`;
 
     const lines = [this.borderLine(innerWidth, "top")];
 
     lines.push(this.frameLine(this.theme.fg("accent", this.theme.bold(this.modeTextValue.trim())), innerWidth));
-    lines.push(this.frameLine(this.theme.fg("dim", summary), innerWidth));
+    lines.push(this.frameLine(summaryLineContent, innerWidth));
     lines.push(this.ruleLine(innerWidth));
 
     for (const line of visibleTranscript) {
@@ -1870,20 +2222,20 @@ class BtwOverlayComponent extends Container implements Focusable {
       displayStatus = `${SPINNER_FRAMES[this.spinnerIndex]} ${clean} (${elapsed}s)`;
     }
     lines.push(this.frameLine(this.theme.fg("warning", displayStatus.trim()), innerWidth));
-    lines.push(this.inputFrameLine(dialogWidth));
+    lines.push(...editorLines);
     lines.push(this.frameLine(this.theme.fg("dim", this.hintsTextValue.trim()), innerWidth));
     lines.push(this.borderLine(innerWidth, "bottom"));
 
-    return lines.map((line) => this.fitRenderedLine(line, width));
+    return lines.map((line) => this.applyOverlayBackground(this.fitRenderedLine(line, width), width));
   }
 
   setDraft(value: string): void {
-    this.input.setValue(value);
+    this.input.setText(value);
     this.tui.requestRender();
   }
 
   getDraft(): string {
-    return this.input.getValue();
+    return this.input.getText();
   }
 
   getTranscriptEntries(): BtwTranscript {
@@ -1891,6 +2243,7 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   refresh(): void {
+    this.refreshAutocomplete();
     const debugTag = this.getDebug() ? " · debug" : "";
     const modelInfo = this.getModelInfo();
     const modelTag = modelInfo ? ` · ${modelInfo}` : "";
@@ -1903,17 +2256,20 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.summaryText.setText(this.summaryTextValue);
 
     const disambiguation = this.getDisambiguation?.();
-    this.rebuildTranscriptLines(entries, disambiguation);
+    const thinkingSelection = this.getThinkingSelection?.();
+    this.rebuildTranscriptLines(entries, disambiguation, thinkingSelection);
 
     const defaultStatus = disambiguation
       ? `Ambiguous model "${disambiguation.query}". Choose 1-${disambiguation.candidates.length}:`
-      : "Ready. Enter submits; Escape dismisses without clearing.";
+      : thinkingSelection
+        ? `Select thinking level (1-${thinkingSelection.levels.length}) or type cancel:`
+        : "Ready. Enter submits; Escape dismisses without clearing.";
     const status = this.getStatus() ?? defaultStatus;
     this.statusTextValue = status;
     this.statusText.setText(this.statusTextValue);
-    this.hintsTextValue = disambiguation
+    this.hintsTextValue = disambiguation || thinkingSelection
       ? "Enter: confirm choice · Esc: cancel"
-      : "PgUp/PgDn/↑↓ scroll · Enter submit · Alt+/ focus · Ctrl+C stop · Esc hide";
+      : "Shift+↑↓/PgUp/PgDn scroll · / skills · @ files · Enter submit · Alt+/ focus · Ctrl+C stop · Esc hide";
     this.hintsText.setText(this.hintsTextValue);
     this.tui.requestRender();
   }
@@ -1921,6 +2277,7 @@ class BtwOverlayComponent extends Container implements Focusable {
   private rebuildTranscriptLines(
     entries: BtwTranscript,
     disambiguation: ModelDisambiguationState | null | undefined,
+    thinkingSelection: ThinkingSelectionState | null | undefined,
   ): void {
     this.transcriptLines = buildOverlayTranscript(entries, this.theme, this.getDebug(), this.lastContentWidth);
     if (disambiguation) {
@@ -1933,6 +2290,22 @@ class BtwOverlayComponent extends Container implements Focusable {
         this.theme.fg("dim", `Type 1-${disambiguation.candidates.length} or model name to confirm (or type cancel).`),
       ];
       this.transcriptLines = [...this.transcriptLines, ...disambiguationLines];
+    }
+    if (thinkingSelection) {
+      const thinkingLines = [
+        "",
+        this.theme.fg(
+          "accent",
+          this.theme.bold(`Thinking levels for ${thinkingSelection.model.provider}/${thinkingSelection.model.id}:`),
+        ),
+        ...thinkingSelection.levels.map((level, i) => {
+          const isActive = level === thinkingSelection.activeLevel;
+          const label = isActive ? this.theme.fg("accent", `${level} *`) : level;
+          return `  ${this.theme.fg("warning", `[${i + 1}]`)} ${label}`;
+        }),
+        this.theme.fg("dim", `Type 1-${thinkingSelection.levels.length}, a level name, or clear (or type cancel).`),
+      ];
+      this.transcriptLines = [...this.transcriptLines, ...thinkingLines];
     }
     this.transcript.clear();
     for (const line of this.transcriptLines) {
@@ -1955,6 +2328,7 @@ export default function (pi: ExtensionAPI) {
   let lastUiContext: ExtensionContext | ExtensionCommandContext | null = null;
   let activeBtwSession: BtwSessionRuntime | null = null;
   let pendingModelDisambiguation: ModelDisambiguationState | null = null;
+  let pendingThinkingSelection: ThinkingSelectionState | null = null;
   let pendingSessionDispose = false;
   const pendingCommandDetachWaiters = new Set<() => void>();
 
@@ -1972,6 +2346,36 @@ export default function (pi: ExtensionAPI) {
     if (model && thinking) return `${model.provider}/${model.id} · thinking: ${thinking}`;
     const requested = btwModelOverride ?? currentMainModel ?? lastUiContext?.model;
     return requested ? `requested: ${requested.provider}/${requested.id} · pending physical settings` : "physical settings unavailable";
+  }
+
+  function getOverlayContextUsage(): BtwContextUsageInfo | null {
+    const sessionUsage = activeBtwSession?.session.getContextUsage?.();
+    const model = activeBtwSession?.session.model ?? activeBtwSession?.pair.model ?? btwModelOverride ?? currentMainModel ?? lastUiContext?.model;
+    const contextWindow = sessionUsage?.contextWindow ?? model?.contextWindow ?? 0;
+    if (contextWindow <= 0) {
+      return null;
+    }
+
+    if (sessionUsage && sessionUsage.tokens !== null && sessionUsage.percent !== null) {
+      return {
+        text: `${sessionUsage.percent.toFixed(1)}% (${formatTokenCount(sessionUsage.tokens)} / ${formatTokenCount(contextWindow)})`,
+        level: sessionUsage.percent > 90 ? "error" : sessionUsage.percent > 70 ? "warning" : "normal",
+      };
+    }
+
+    const lastUsage = pendingThread.at(-1)?.usage;
+    if (lastUsage && lastUsage.totalTokens > 0) {
+      const percent = (lastUsage.totalTokens / contextWindow) * 100;
+      return {
+        text: `${percent.toFixed(1)}% (${formatTokenCount(lastUsage.totalTokens)} / ${formatTokenCount(contextWindow)})`,
+        level: percent > 90 ? "error" : percent > 70 ? "warning" : "normal",
+      };
+    }
+
+    return {
+      text: `? / ${formatTokenCount(contextWindow)}`,
+      level: "normal",
+    };
   }
 
   function syncUi(ctx?: ExtensionContext | ExtensionCommandContext): void {
@@ -1994,12 +2398,14 @@ export default function (pi: ExtensionAPI) {
 
   function dismissOverlay(): void {
     pendingModelDisambiguation = null;
+    pendingThinkingSelection = null;
     overlayRuntime?.close?.();
     overlayRuntime = null;
   }
 
   function hideOverlay(): void {
     pendingModelDisambiguation = null;
+    pendingThinkingSelection = null;
     const handle = overlayRuntime?.handle;
     if (!handle) {
       return;
@@ -2094,6 +2500,32 @@ export default function (pi: ExtensionAPI) {
 
     if (event.type === "tool_execution_end") {
       setOverlayStatus("thinking...", ctx);
+      return;
+    }
+
+    if (event.type === "compaction_start") {
+      const reasonLabel =
+        event.reason === "overflow"
+          ? " (context overflow)"
+          : event.reason === "threshold"
+            ? " (threshold)"
+            : "";
+      setOverlayStatus(`compacting context${reasonLabel}...`, ctx);
+      return;
+    }
+
+    if (event.type === "compaction_end") {
+      if (event.aborted) {
+        setOverlayStatus("Compaction aborted.", ctx);
+      } else if (event.errorMessage) {
+        setOverlayStatus(`Compaction failed: ${event.errorMessage}`, ctx);
+      } else if (event.willRetry) {
+        setOverlayStatus("Compaction complete; retrying request...", ctx);
+      } else if (event.result) {
+        setOverlayStatus(`Compacted context from ${formatTokenCount(event.result.tokensBefore)} tokens.`, ctx);
+      } else {
+        setOverlayStatus("Compaction complete.", ctx);
+      }
       return;
     }
 
@@ -2354,7 +2786,7 @@ export default function (pi: ExtensionAPI) {
       },
     });
 
-    const thinkingLevel = clampThinkingLevel(settings.model, settings.thinkingLevel);
+    const thinkingLevel = clampBtwThinkingLevel(settings.model, settings.thinkingLevel);
     const identityPrompt = `You are currently running as model ${formatModelRef(settings.model)} with thinking level ${thinkingLevel}.`;
     const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode, settings.model);
     const sessionManager = SessionManager.inMemory(ctx.cwd);
@@ -2462,6 +2894,17 @@ export default function (pi: ExtensionAPI) {
             () => {
               void stopBtwTurn(ctx);
             },
+            () => getOverlayContextUsage(),
+            {
+              getCommands: () =>
+                getBtwSkillCommands(pi).map((skill) => ({
+                  name: skill.name,
+                  description: skill.description,
+                })),
+              basePath: ctx.cwd,
+              fdPath: resolveFdPath(),
+            },
+            () => pendingThinkingSelection,
           );
 
           overlay.focused = runtime.handle?.isFocused() ?? true;
@@ -2493,8 +2936,8 @@ export default function (pi: ExtensionAPI) {
             width: "78%",
             minWidth: 72,
             maxHeight: "78%",
-            anchor: "top-center",
-            margin: { top: 1, left: 2, right: 2 },
+            anchor: "center",
+            margin: { top: 1, bottom: 1, left: 2, right: 2 },
             nonCapturing: true,
           },
           onHandle: (handle) => {
@@ -2533,6 +2976,7 @@ export default function (pi: ExtensionAPI) {
     pendingQuestion: string | undefined,
     save: boolean,
     mode: BtwThreadMode,
+    modelPool?: SessionModel[],
   ): Promise<{ proceed: boolean }> {
     if (thinkingLevel) {
       await setBtwThinkingOverride(ctx, (thinkingLevel as string) === "clear" ? null : thinkingLevel);
@@ -2542,7 +2986,7 @@ export default function (pi: ExtensionAPI) {
       if (modelQuery.toLowerCase() === "clear") {
         await setBtwModelOverride(ctx, null);
       } else {
-        const res = await resolveBtwModelQuery(ctx, modelQuery);
+        const res = await resolveBtwModelQuery(ctx, modelQuery, modelPool);
         if (res.status === "not_found") {
           setOverlayStatus(res.error, ctx);
           notify(ctx, res.error, "error");
@@ -2550,6 +2994,7 @@ export default function (pi: ExtensionAPI) {
           return { proceed: false };
         }
         if (res.status === "ambiguous") {
+          pendingThinkingSelection = null;
           pendingModelDisambiguation = {
             query: modelQuery,
             candidates: res.candidates,
@@ -2568,7 +3013,12 @@ export default function (pi: ExtensionAPI) {
     return { proceed: true };
   }
 
-  async function dispatchBtwCommand(name: string, args: string, ctx: ExtensionCommandContext): Promise<boolean> {
+  async function dispatchBtwCommand(
+    name: string,
+    args: string,
+    ctx: ExtensionCommandContext,
+    options: { fromOverlay?: boolean } = {},
+  ): Promise<boolean> {
     const trimmedArgs = args.trim();
 
     if (name === "btw") {
@@ -2681,15 +3131,114 @@ export default function (pi: ExtensionAPI) {
 
     if (name === "btw:thinking") {
       const parsed = parseBtwThinkingArgs(trimmedArgs);
+      const settings = await resolveBtwSettings(ctx);
+      const activeModel = activeBtwSession?.session.model ?? activeBtwSession?.pair.model ?? settings.model;
+      const supportedLevels = activeModel
+        ? getEffectiveSupportedThinkingLevels(activeModel)
+        : [...ALL_THINKING_LEVELS];
+
       if (parsed.action === "show") {
-        const settings = await resolveBtwSettings(ctx);
+        if (options.fromOverlay && activeModel && settings.thinkingLevel) {
+          pendingModelDisambiguation = null;
+          const rawActive =
+            activeBtwSession?.session.thinkingLevel ?? activeBtwSession?.pair.thinkingLevel ?? settings.thinkingLevel;
+          const activeLevel = clampBtwThinkingLevel(activeModel, rawActive);
+          pendingThinkingSelection = {
+            model: activeModel,
+            levels: supportedLevels,
+            activeLevel,
+          };
+          setOverlayStatus(
+            `${describeResolvedThinking({ ...settings, thinkingLevel: activeLevel })} Choose 1-${supportedLevels.length} or type a level (or cancel).`,
+            ctx,
+          );
+          await ensureOverlay(ctx);
+          return true;
+        }
+
         const message = describeResolvedThinking(settings);
         setOverlayStatus(message, ctx);
         notify(ctx, message, "info");
         return true;
       }
 
-      await setBtwThinkingOverride(ctx, parsed.action === "clear" ? null : parsed.thinkingLevel);
+      if (parsed.action === "clear") {
+        pendingThinkingSelection = null;
+        await setBtwThinkingOverride(ctx, null);
+        return true;
+      }
+
+      const isGoogleModel = activeModel?.api === "google-vertex" || activeModel?.api === "google-generative-ai";
+      if (
+        !ALL_THINKING_LEVELS.includes(parsed.thinkingLevel) ||
+        (isGoogleModel && !supportedLevels.includes(parsed.thinkingLevel))
+      ) {
+        const msg = `Unsupported thinking level "${parsed.thinkingLevel}". Available: ${supportedLevels.join(", ")}.`;
+        setOverlayStatus(msg, ctx);
+        notify(ctx, msg, "error");
+        return true;
+      }
+
+      pendingThinkingSelection = null;
+      await setBtwThinkingOverride(ctx, parsed.thinkingLevel);
+      return true;
+    }
+
+    if (name === "btw:model") {
+      const { models: enabledModels, filteredByEnabledModels } = getEnabledAvailableModels(ctx);
+
+      if (!trimmedArgs) {
+        if (enabledModels.length === 0) {
+          const settings = await resolveBtwSettings(ctx);
+          const message = filteredByEnabledModels
+            ? "No physical models match your enabledModels settings."
+            : describeResolvedModel(settings);
+          setOverlayStatus(message, ctx);
+          notify(ctx, message, filteredByEnabledModels ? "warning" : "info");
+          return true;
+        }
+        const authChecks = await Promise.all(
+          enabledModels.map(async (m) => {
+            try {
+              const res = await ctx.modelRegistry.getApiKeyAndHeaders(m);
+              return res.ok;
+            } catch {
+              return false;
+            }
+          }),
+        );
+        const authenticated = enabledModels.filter((_, i) => authChecks[i]);
+        const candidates = authenticated.length > 0 ? authenticated : enabledModels;
+        pendingThinkingSelection = null;
+        pendingModelDisambiguation = {
+          query: filteredByEnabledModels ? "enabled models" : "available models",
+          candidates,
+          save: false,
+          mode: pendingMode,
+        };
+        const settings = await resolveBtwSettings(ctx);
+        setOverlayStatus(`${describeResolvedModel(settings)} Choose 1-${candidates.length} or type a model name (or cancel).`, ctx);
+        await ensureOverlay(ctx);
+        return true;
+      }
+
+      if (/^(?:clear|reset|default)$/i.test(trimmedArgs)) {
+        await setBtwModelOverride(ctx, null);
+        return true;
+      }
+
+      const flagResult = await applyModelAndThinkingFlags(
+        ctx,
+        trimmedArgs,
+        undefined,
+        undefined,
+        false,
+        pendingMode,
+        filteredByEnabledModels ? enabledModels : undefined,
+      );
+      if (flagResult.proceed) {
+        await ensureOverlay(ctx);
+      }
       return true;
     }
 
@@ -2786,7 +3335,7 @@ export default function (pi: ExtensionAPI) {
   function parseOverlayBtwCommand(value: string): { name: string; args: string; bare: boolean } | null {
     const trimmed = value.trim();
     const match = trimmed.match(
-      /^\/(?:btw:(new|tangent|clear|inject|summarize|thinking|debug|copy|sync)|btw\b|(new|tangent|clear|inject|summarize|thinking|debug|copy|sync)\b)(?:\s+(.*))?$/i,
+      /^\/(?:btw:(new|tangent|clear|inject|summarize|thinking|model|debug|copy|sync)|btw\b|(new|tangent|clear|inject|summarize|thinking|model|debug|copy|sync)\b)(?:\s+(.*))?$/i,
     );
     if (!match) {
       return null;
@@ -2801,33 +3350,6 @@ export default function (pi: ExtensionAPI) {
       bare: Boolean(bareCmd),
     };
   }
-
-function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?: SessionThinkingLevel } | null {
-  const t = text.trim();
-
-  const thinkMatch = t.match(
-    /^(?:(?:can you\s+)?(?:set|change|turn|switch)\s+(?:the\s+)?thinking(?:\s+level)?(?:\s+to)?\s+|(?:thinking(?:\s+level)?(?:\s*[:=]\s*|\s+)))(off|low|medium|high|xhigh|max|clear)(?:\s+please)?$/i,
-  );
-  if (thinkMatch) {
-    return { thinking: thinkMatch[1].toLowerCase() as SessionThinkingLevel };
-  }
-
-  const modelMatch = t.match(
-    /^(?:can you\s+)?(?:please\s+)?(?:use|switch(?:\s+model)?(?:\s+to)?|change(?:\s+model)?(?:\s+to)?|set\s+model\s+to)\s+(?:the\s+)?(.+?)(?:\s+model)?(?:\s+please)?$/i,
-  );
-  if (modelMatch) {
-    const raw = modelMatch[1].trim();
-    const withThinking = raw.match(
-      /^(.+?)\s+(?:with|and)\s+(?:thinking\s+(?:level\s+)?(?:to\s+)?)?(off|low|medium|high|xhigh|max|clear)$/i,
-    );
-    if (withThinking) {
-      return { modelQuery: withThinking[1].trim(), thinking: withThinking[2].toLowerCase() as SessionThinkingLevel };
-    }
-    return { modelQuery: raw };
-  }
-
-  return null;
-}
 
   async function submitFromOverlay(ctx: ExtensionCommandContext | ExtensionContext, value: string): Promise<void> {
     const question = value.trim();
@@ -2890,75 +3412,51 @@ function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?:
       return;
     }
 
+    if (pendingThinkingSelection) {
+      setOverlayDraft("");
+      const input = question.toLowerCase();
+      if (input === "cancel" || input === "/clear") {
+        pendingThinkingSelection = null;
+        setOverlayStatus("Thinking level selection cancelled.", cmdCtx);
+        syncUi(cmdCtx);
+        return;
+      }
+
+      if (input === "clear") {
+        pendingThinkingSelection = null;
+        await setBtwThinkingOverride(cmdCtx, null);
+        syncUi(cmdCtx);
+        return;
+      }
+
+      const num = parseInt(input, 10);
+      let chosenLevel: SessionThinkingLevel | undefined;
+      if (!isNaN(num) && num >= 1 && num <= pendingThinkingSelection.levels.length) {
+        chosenLevel = pendingThinkingSelection.levels[num - 1];
+      } else {
+        chosenLevel = pendingThinkingSelection.levels.find((level) => level.toLowerCase() === input);
+      }
+
+      if (!chosenLevel) {
+        setOverlayStatus(
+          `Invalid thinking level. Enter 1-${pendingThinkingSelection.levels.length}, a level name, clear, or cancel.`,
+          cmdCtx,
+        );
+        syncUi(cmdCtx);
+        return;
+      }
+
+      pendingThinkingSelection = null;
+      await setBtwThinkingOverride(cmdCtx, chosenLevel);
+      syncUi(cmdCtx);
+      return;
+    }
+
     // Allow flags like --model or -m or --thinking or -t directly in the overlay composer
     if (/^(?:--model|-m\s|--thinking|-t\s)/i.test(question)) {
       setOverlayDraft("");
       await dispatchBtwCommand("btw", question, cmdCtx);
       return;
-    }
-
-    // Direct conversational model or thinking switch intent (instant local execution)
-    const switchIntent = parseModelSwitchIntent(question);
-    if (switchIntent) {
-      if (switchIntent.thinking && !switchIntent.modelQuery) {
-        setOverlayDraft("");
-        await setBtwThinkingOverride(cmdCtx, (switchIntent.thinking as string) === "clear" ? null : switchIntent.thinking);
-        const settings = await resolveBtwSettings(cmdCtx);
-        if (settings.thinkingLevel) appendPersistedTranscriptTurn(transcriptState, {
-          question,
-          thinking: "",
-          answer: `Switched BTW thinking level to \`${settings.thinkingLevel}\`.`,
-          provider: settings.model?.provider ?? "unknown",
-          model: settings.model?.id ?? "unknown",
-          api: settings.model?.api ?? "openai-responses",
-          thinkingLevel: settings.thinkingLevel,
-          timestamp: Date.now(),
-        });
-        setOverlayStatus("Ready for a follow-up.", cmdCtx);
-        syncUi(cmdCtx);
-        return;
-      }
-
-      if (switchIntent.modelQuery) {
-        const res = await resolveBtwModelQuery(cmdCtx, switchIntent.modelQuery);
-        if (res.status === "resolved") {
-          setOverlayDraft("");
-          await setBtwModelOverride(cmdCtx, res.model);
-          if (switchIntent.thinking) {
-            await setBtwThinkingOverride(cmdCtx, (switchIntent.thinking as string) === "clear" ? null : switchIntent.thinking);
-          }
-          const settings = await resolveBtwSettings(cmdCtx);
-          if (settings.thinkingLevel) appendPersistedTranscriptTurn(transcriptState, {
-            question,
-            thinking: "",
-            answer: `Switched BTW model to \`${formatModelRef(res.model)}\`. It will take effect on your next message.`,
-            provider: res.model.provider,
-            model: res.model.id,
-            api: res.model.api,
-            thinkingLevel: settings.thinkingLevel,
-            timestamp: Date.now(),
-          });
-          setOverlayStatus("Ready for a follow-up.", cmdCtx);
-          syncUi(cmdCtx);
-          return;
-        }
-
-        if (res.status === "ambiguous") {
-          setOverlayDraft("");
-          pendingModelDisambiguation = {
-            query: switchIntent.modelQuery,
-            candidates: res.candidates,
-            save: false,
-            mode: pendingMode,
-          };
-          setOverlayStatus(`Multiple models match "${switchIntent.modelQuery}". Choose one below.`, cmdCtx);
-          syncUi(cmdCtx);
-          return;
-        }
-        setOverlayStatus(res.error, cmdCtx);
-        notify(cmdCtx, res.error, "error");
-        return;
-      }
     }
 
     const btwCommand = parseOverlayBtwCommand(question);
@@ -2970,7 +3468,7 @@ function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?:
         notify(cmdCtx, "Cleared BTW thread.", "info");
         return;
       }
-      await dispatchBtwCommand(btwCommand.name, btwCommand.args, cmdCtx);
+      await dispatchBtwCommand(btwCommand.name, btwCommand.args, cmdCtx, { fromOverlay: true });
       return;
     }
 
@@ -2989,6 +3487,7 @@ function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?:
     pendingThread = [];
     pendingMode = mode;
     pendingModelDisambiguation = null;
+    pendingThinkingSelection = null;
     debugMode = false;
     transcriptState = createEmptyTranscriptState();
     setOverlayDraft("");
@@ -3099,7 +3598,8 @@ function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?:
 
     const runPromptLifecycle = async (): Promise<void> => {
       try {
-        await session.prompt(question, {
+        const promptQuestion = expandBtwSkillCommand(question, getBtwSkillCommands(pi));
+        await session.prompt(promptQuestion, {
           source: "extension",
           ...(session.isStreaming ? { streamingBehavior: "followUp" as const } : {}),
         });
@@ -3256,8 +3756,10 @@ function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?:
       }
     };
 
-    const supportedLevels = getSupportedThinkingLevels(model);
-    const safeFallback: SessionThinkingLevel = settings.thinkingLevel !== "off" ? settings.thinkingLevel : "low";
+    const supportedLevels = getEffectiveSupportedThinkingLevels(model);
+    const clampedFallback = clampBtwThinkingLevel(model, settings.thinkingLevel);
+    const safeFallback: SessionThinkingLevel =
+      clampedFallback !== "off" ? clampedFallback : (supportedLevels.find((l) => l !== "off") ?? "low");
     const preferredLevel: SessionThinkingLevel = supportedLevels.includes("off") ? "off" : safeFallback;
 
     try {

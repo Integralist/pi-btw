@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, RegisteredCommand } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import btwExtension from "../extensions/btw";
@@ -331,6 +334,14 @@ function createMockAgentSession(options: any) {
     get isStreaming() {
       return isStreaming;
     },
+    getContextUsage: vi.fn(() => {
+      const contextWindow = options.model?.contextWindow ?? 0;
+      if (contextWindow <= 0) return undefined;
+      const lastAssistant = [...stateMessages].reverse().find((m) => m.role === "assistant" && m.usage?.totalTokens);
+      if (!lastAssistant) return { tokens: 0, contextWindow, percent: 0 };
+      const tokens = lastAssistant.usage.totalTokens;
+      return { tokens, contextWindow, percent: (tokens / contextWindow) * 100 };
+    }),
     subscribe: vi.fn((listener: (event: any) => void) => {
       listeners.add(listener);
       return () => listeners.delete(listener);
@@ -470,8 +481,12 @@ function createHarness(
       bg: (name: string, text: string) => string;
       italic: (text: string) => string;
       bold: (text: string) => string;
+      getBgAnsi?: (name: string) => string;
     };
     keybindingMatches?: (data: string, id: string) => boolean;
+    extraCommands?: Array<{ name: string; description?: string; source: "extension" | "prompt" | "skill"; sourceInfo: { path: string; source: string; scope: "user" | "project" | "temporary"; origin: "package" | "top-level"; baseDir?: string } }>;
+    cwd?: string;
+    contextWindow?: number;
   } = {},
 ) {
   const commands = new Map<string, RegisteredCommand>();
@@ -501,7 +516,12 @@ function createHarness(
     getBranch: () => entries,
   };
 
-  const model = { provider: "test-provider", id: "test-model", api: "openai-responses" };
+  const model: { provider: string; id: string; api: string; contextWindow?: number } = {
+    provider: "test-provider",
+    id: "test-model",
+    api: "openai-responses",
+    ...(options.contextWindow ? { contextWindow: options.contextWindow } : {}),
+  };
   let idle = true;
   let hasCredentials = true;
   let mainThinkingLevel: string = "off";
@@ -581,7 +601,7 @@ function createHarness(
     getActiveTools: vi.fn(() => []) as any,
     getAllTools: vi.fn(() => []) as any,
     setActiveTools: vi.fn() as any,
-    getCommands: vi.fn(() => Array.from(commands.values())) as any,
+    getCommands: vi.fn(() => [...Array.from(commands.values()), ...(options.extraCommands ?? [])]) as any,
     setModel: vi.fn(async () => true) as any,
     getThinkingLevel: vi.fn(() => mainThinkingLevel) as any,
     setThinkingLevel: vi.fn() as any,
@@ -591,7 +611,7 @@ function createHarness(
   btwExtension(api);
 
   const baseCtx = {
-    cwd: process.cwd(),
+    cwd: options.cwd ?? process.cwd(),
     hasUI: true,
     ui: ui as any,
     sessionManager: sessionManager as any,
@@ -1257,10 +1277,10 @@ describe("btw runtime behavior", () => {
     await harness.command("btw", "");
 
     const overlay = harness.latestOverlayComponent();
-    overlay.input.setValue("draft follow-up");
+    overlay.input.setText("draft follow-up");
     overlay.input.handleInput("\x03");
 
-    expect(overlay.input.getValue()).toBe("");
+    expect(overlay.input.getText()).toBe("");
     expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
   });
 
@@ -1283,7 +1303,7 @@ describe("btw runtime behavior", () => {
     const firstRecord = subSessionRecords[0];
     expect(firstRecord.getIsStreaming()).toBe(true);
 
-    overlay.input.setValue("");
+    overlay.input.setText("");
     overlay.input.handleInput("\x03");
     await flushAsyncWork();
 
@@ -1309,7 +1329,7 @@ describe("btw runtime behavior", () => {
 
     const overlay = harness.latestOverlayComponent();
     const handle = harness.overlayHandles.at(-1);
-    overlay.input.setValue("draft follow-up");
+    overlay.input.setText("draft follow-up");
     overlay.input.handleInput("\x1b");
     await flushAsyncWork();
 
@@ -1344,7 +1364,7 @@ describe("btw runtime behavior", () => {
     await flushAsyncWork();
     expect(commandResolved).toBe(false);
 
-    overlay.input.onEscape?.();
+    overlay.input.handleInput("\x1b");
     await flushAsyncWork();
 
     // Command handler must resolve on Escape so Pi's main InteractiveMode loop can immediately
@@ -1374,7 +1394,7 @@ describe("btw runtime behavior", () => {
     expect(handle?.isFocused()).toBe(true);
 
     // Hide again before completion, then let the background stream finish
-    overlay.input.onEscape?.();
+    overlay.input.handleInput("\x1b");
     expect(handle?.isHidden()).toBe(true);
 
     blocking.release();
@@ -1473,7 +1493,7 @@ describe("btw runtime behavior", () => {
     const firstRecord = subSessionRecords[0];
     const overlay = harness.latestOverlayComponent();
     const handle = harness.overlayHandles[0];
-    overlay.input.onEscape?.();
+    overlay.input.handleInput("\x1b");
     await flushAsyncWork();
 
     expect(firstRecord.session.abort).not.toHaveBeenCalled();
@@ -1831,7 +1851,7 @@ describe("btw runtime behavior", () => {
     await harness.command("btw", "first question");
 
     const overlay = harness.latestOverlayComponent();
-    overlay.input.setValue("follow-up question");
+    overlay.input.setText("follow-up question");
     overlay.input.onSubmit?.("follow-up question");
     await flushAsyncWork();
 
@@ -1876,7 +1896,7 @@ describe("btw runtime behavior", () => {
     });
   });
 
-  it("keeps BTW in a top-centered non-capturing overlay and does not leave a persistent widget above the main input", async () => {
+  it("keeps BTW in a centered non-capturing overlay and does not leave a persistent widget above the main input", async () => {
     const harness = createHarness();
     promptStreamMock.mockImplementation(() => streamAnswer("Overlay answer"));
 
@@ -1886,7 +1906,7 @@ describe("btw runtime behavior", () => {
     expect(harness.overlays.at(-1)?.factoryOptions).toMatchObject({
       overlay: true,
       overlayOptions: {
-        anchor: "top-center",
+        anchor: "center",
         nonCapturing: true,
       },
     });
@@ -1991,7 +2011,7 @@ describe("btw runtime behavior", () => {
 
     const populatedLines = overlay.render(80);
     const emptyStateLine = emptyLines.find((line: string) => line.includes("No BTW thread yet."));
-    const inputLine = populatedLines.at(-3);
+    const editorBorderLine = populatedLines.at(-3);
     const assistantBodyLine = populatedLines.find((line: string) => line.includes("First answer"));
 
     expect(emptyLines.length).toBe(populatedLines.length);
@@ -2001,8 +2021,8 @@ describe("btw runtime behavior", () => {
     expect(emptyLines.at(-1)).not.toContain("<fg:accent>└");
     expect(emptyStateLine).toContain("<fg:border>│</fg:border>  <fg:dim>No BTW thread yet.");
     expect(assistantBodyLine).toContain("<fg:border>│</fg:border>      First answer");
-    expect(inputLine).toContain("<fg:border>│</fg:border>  > ");
-    expect(inputLine).not.toContain("\x1b_pi:c\x07");
+    expect(editorBorderLine).toContain("<fg:borderMuted>");
+    expect(populatedLines.join("\n")).not.toContain("\x1b_pi:c\x07");
   });
 
   it("/btw:new appends a reset marker, disposes the old sub-session, clears prior hidden thread state, stays contextual, and reopens a fresh thread", async () => {
@@ -2544,7 +2564,7 @@ describe("btw runtime behavior", () => {
     const overlay = harness.latestOverlayComponent();
     overlay.input.onSubmit?.("follow-up question");
     await flushAsyncWork();
-    overlay.input.onEscape?.();
+    overlay.input.handleInput("\x1b");
     await flushAsyncWork();
 
     expect(harness.sentUserMessages).toHaveLength(0);
@@ -2802,7 +2822,8 @@ describe("btw runtime behavior", () => {
   describe("overlay render height vs maxHeight", () => {
     function resolveOverlayMaxHeight(rows: number): number {
       const marginTop = 1;
-      const availHeight = Math.max(1, rows - marginTop);
+      const marginBottom = 1;
+      const availHeight = Math.max(1, rows - marginTop - marginBottom);
       const parsed = Math.floor((rows * 78) / 100);
       return Math.max(1, Math.min(parsed, availHeight));
     }
@@ -2862,5 +2883,536 @@ describe("BTW restored text handoff correction", () => {
     expect(createAgentSessionMock).not.toHaveBeenCalled();
     expect(promptStreamMock).not.toHaveBeenCalled();
     expect(getCustomEntries(h.entries, "btw-thread-reset")).toHaveLength(1);
+  });
+});
+
+describe("BTW overlay Editor, skill autocomplete, context meter, and background styling", () => {
+  beforeEach(() => {
+    createAgentSessionMock.mockReset();
+    promptStreamMock.mockReset();
+    sessionManagerInMemoryMock.mockClear();
+    subSessionRecords.length = 0;
+
+    createAgentSessionMock.mockImplementation(async (options: any) => createMockAgentSession(options));
+    promptStreamMock.mockImplementation((_record: unknown, _text: string, context: StreamContext) => {
+      return streamAnswer(`default:${(context.messages.at(-1)?.content[0] as any)?.text ?? ""}`);
+    });
+  });
+
+  it("wraps long composer drafts across multiple lines without exceeding overlay height", async () => {
+    const harness = createHarness();
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    const baselineLines = overlay.render(80);
+
+    overlay.setDraft(
+      "This is a very long side-thread question that should wrap cleanly across multiple composer lines inside the overlay instead of scrolling off-screen horizontally.",
+    );
+    const wrappedLines = overlay.render(80);
+
+    expect(wrappedLines.length).toBe(baselineLines.length);
+    expect(wrappedLines.join("\n")).toContain("instead of scrolling");
+    expect(wrappedLines.at(-1)).toMatch(/└/);
+  });
+
+  it("scrolls the transcript with Shift+Up and Shift+Down while forwarding plain Up/Down to the Editor", async () => {
+    const harness = createHarness();
+    const longAnswer = Array.from({ length: 30 }, (_, index) => `transcript line ${index + 1}`).join("\n");
+    promptStreamMock.mockImplementationOnce(() => streamAnswer(longAnswer));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "scroll test");
+
+    const overlay = harness.latestOverlayComponent();
+    const inputHandleSpy = vi.spyOn(overlay.input, "handleInput");
+
+    const atBottom = overlay.render(80).join("\n");
+    expect(atBottom).toContain("transcript line 30");
+
+    // Plain Up goes to Editor (not transcript scroll)
+    overlay.handleInput("\x1b[A");
+    expect(inputHandleSpy).toHaveBeenCalledWith("\x1b[A");
+
+    // Shift+Up scrolls transcript up
+    overlay.handleInput("\x1b[1;2A");
+    const scrolledUp = overlay.render(80).join("\n");
+    expect(scrolledUp).toContain("↓1");
+
+    // Shift+Down scrolls back down
+    overlay.handleInput("\x1b[1;2B");
+    const scrolledDown = overlay.render(80).join("\n");
+    expect(scrolledDown).toContain("transcript line 30");
+  });
+
+  it("autocompletes only skills on leading / and closes autocomplete before dismissing on Esc", async () => {
+    const skillDir = mkdtempSync(path.join(tmpdir(), "btw-skill-auto-"));
+    try {
+      const skillFile = path.join(skillDir, "SKILL.md");
+      writeFileSync(skillFile, "---\nname: architect\ndescription: Design architecture\n---\nFollow architectural steps.\n");
+      const harness = createHarness([], {
+        extraCommands: [
+          {
+            name: "skill:architect",
+            description: "Design architecture",
+            source: "skill",
+            sourceInfo: { path: skillFile, source: "user", scope: "user", origin: "top-level", baseDir: skillDir },
+          },
+          {
+            name: "commit",
+            description: "Main extension command",
+            source: "extension",
+            sourceInfo: { path: "/tmp/commit.ts", source: "user", scope: "user", origin: "top-level" },
+          },
+        ],
+      });
+
+      await harness.runSessionStart();
+      await harness.command("btw", "");
+
+      const overlay = harness.latestOverlayComponent();
+      const handle = harness.overlayHandles.at(-1);
+
+      // Type "/" + "arc" one char at a time so Editor triggers autocomplete
+      for (const ch of "/arc") {
+        overlay.handleInput(ch);
+      }
+
+      await vi.waitFor(() => {
+        expect(overlay.input.isShowingAutocomplete()).toBe(true);
+      });
+
+      const rendered = overlay.render(90).join("\n");
+      expect(rendered).toContain("skill:architect");
+      expect(rendered).not.toContain("Main extension command");
+
+      // First Esc cancels autocomplete without hiding the overlay
+      overlay.handleInput("\x1b");
+      expect(overlay.input.isShowingAutocomplete()).toBe(false);
+      expect(handle?.isHidden()).toBe(false);
+
+      // Tab-completing from /arc inserts /skill:architect
+      for (const ch of "h") {
+        overlay.handleInput(ch);
+      }
+      overlay.handleInput("\x1b"); // reset if open
+      overlay.setDraft("");
+      for (const ch of "/arc") {
+        overlay.handleInput(ch);
+      }
+      await vi.waitFor(() => {
+        expect(overlay.input.isShowingAutocomplete()).toBe(true);
+      });
+      overlay.handleInput("\t");
+      expect(overlay.getDraft()).toBe("/skill:architect ");
+    } finally {
+      rmSync(skillDir, { recursive: true, force: true });
+    }
+  });
+
+  it("expands /skill:<name> prompts on submit while keeping the BTW transcript and persisted question compact", async () => {
+    const skillDir = mkdtempSync(path.join(tmpdir(), "btw-skill-expand-"));
+    try {
+      const skillFile = path.join(skillDir, "SKILL.md");
+      writeFileSync(
+        skillFile,
+        "---\nname: architect\ndescription: Design architecture\n---\nStep 1: Inspect module boundaries.\n",
+      );
+      const harness = createHarness([], {
+        extraCommands: [
+          {
+            name: "skill:architect",
+            description: "Design architecture",
+            source: "skill",
+            sourceInfo: { path: skillFile, source: "user", scope: "user", origin: "top-level", baseDir: skillDir },
+          },
+        ],
+      });
+      promptStreamMock.mockImplementationOnce(() => streamAnswer("Skill executed"));
+
+      await harness.runSessionStart();
+      await harness.command("btw", "");
+
+      const overlay = harness.latestOverlayComponent();
+      overlay.input.onSubmit?.("/skill:architect review auth");
+      await flushAsyncWork();
+
+      expect(subSessionRecords[0].promptCalls[0].text).toContain('<skill name="architect"');
+      expect(subSessionRecords[0].promptCalls[0].text).toContain("Step 1: Inspect module boundaries.");
+      expect(subSessionRecords[0].promptCalls[0].text).toContain("review auth");
+
+      const entries = getCustomEntries(harness.entries, "btw-thread-entry");
+      expect(entries).toHaveLength(1);
+      expect((entries[0] as any).data.question).toBe("/skill:architect review auth");
+
+      const rendered = overlay.render(100).join("\n");
+      expect(rendered).toContain("/skill:architect review auth");
+      expect(rendered).not.toContain("Step 1: Inspect module boundaries.");
+    } finally {
+      rmSync(skillDir, { recursive: true, force: true });
+    }
+  });
+
+  it("supports @ file autocomplete against cwd", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "btw-at-complete-"));
+    try {
+      writeFileSync(path.join(dir, "example-target.ts"), "export const x = 1;\n");
+      const harness = createHarness([], { cwd: dir });
+      await harness.runSessionStart();
+      await harness.command("btw", "");
+
+      const overlay = harness.latestOverlayComponent();
+      for (const ch of "check @example") {
+        overlay.handleInput(ch);
+      }
+
+      await vi.waitFor(() => {
+        expect(overlay.input.isShowingAutocomplete()).toBe(true);
+      });
+
+      const rendered = overlay.render(90).join("\n");
+      expect(rendered).toContain("example-target.ts");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("displays BTW context window usage on the summary line and tints the overlay background", async () => {
+    const harness = createHarness([], {
+      contextWindow: 1_000_000,
+      theme: {
+        fg: (name: string, text: string) => (name === "warning" || name === "error" ? `\x1b[33m${text}\x1b[39m` : text),
+        bg: (name: string, text: string) => (name === "toolPendingBg" ? `\x1b[48;5;236m${text}\x1b[49m` : text),
+        italic: (text: string) => text,
+        bold: (text: string) => `\x1b[1m${text}\x1b[0m`,
+      },
+    });
+    promptStreamMock.mockImplementationOnce(async function* () {
+      yield { type: "text_delta" as const, delta: "Context reply" };
+      yield {
+        type: "done" as const,
+        reason: "stop" as const,
+        message: {
+          role: "assistant" as const,
+          content: [{ type: "text" as const, text: "Context reply" }],
+          provider: "test-provider",
+          model: "test-model",
+          api: "openai-responses" as const,
+          usage: {
+            input: 90_000,
+            output: 3_000,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 93_000,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: "stop" as const,
+          timestamp: Date.now(),
+        },
+      };
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    const initialLines = overlay.render(90);
+    expect(initialLines[2]).toContain("0.0% (0 / 1.0M)");
+    expect(initialLines[0].startsWith("\x1b[48;5;236m")).toBe(true);
+    expect(initialLines[0].endsWith("\x1b[49m")).toBe(true);
+    // Re-applies background after inner \x1b[0m reset in title line
+    expect(initialLines[1]).toContain("\x1b[0m\x1b[48;5;236m");
+
+    overlay.input.onSubmit?.("check usage");
+    await flushAsyncWork();
+
+    const updatedLines = overlay.render(90);
+    expect(updatedLines[2]).toContain("9.3% (93k / 1.0M)");
+  });
+
+  it("surfaces compaction_start and compaction_end status messages in the BTW overlay", async () => {
+    const harness = createHarness();
+    await harness.runSessionStart();
+    await harness.command("btw", "initial question");
+
+    const overlay = harness.latestOverlayComponent();
+    const record = subSessionRecords[0];
+
+    record.emit({ type: "compaction_start", reason: "threshold" });
+    expect(overlay.statusText.text).toBe("compacting context (threshold)...");
+
+    record.emit({
+      type: "compaction_end",
+      reason: "threshold",
+      result: { summary: "sum", firstKeptEntryId: "1", tokensBefore: 120_000 },
+      aborted: false,
+      willRetry: false,
+    });
+    expect(overlay.statusText.text).toBe("Compacted context from 120k tokens.");
+
+    record.emit({ type: "compaction_start", reason: "overflow" });
+    expect(overlay.statusText.text).toBe("compacting context (context overflow)...");
+
+    record.emit({
+      type: "compaction_end",
+      reason: "overflow",
+      result: undefined,
+      aborted: false,
+      willRetry: true,
+    });
+    expect(overlay.statusText.text).toBe("Compaction complete; retrying request...");
+
+    record.emit({
+      type: "compaction_end",
+      reason: "overflow",
+      result: undefined,
+      aborted: false,
+      willRetry: false,
+      errorMessage: "boom",
+    });
+    expect(overlay.statusText.text).toBe("Compaction failed: boom");
+  });
+
+  it("treats normal sentences starting with 'use' or 'switch' as prompts and supports /model in the overlay", async () => {
+    const harness = createHarness();
+    harness.registerModel("openai", "gpt-5-mini", "openai-responses");
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("Product voice paragraph."))
+      .mockImplementationOnce(() => streamAnswer("Switched prompt answer."))
+      .mockImplementationOnce(() => streamAnswer("Model answer."));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+
+    // Natural sentences starting with "use", "switch", or "model" pass straight to the LLM
+    const prose1 = "use product voice to write a paragraph about the technical implementation of pi-btw";
+    overlay.input.onSubmit?.(prose1);
+    await flushAsyncWork();
+    expect(subSessionRecords[0].promptCalls[0].text).toBe(prose1);
+
+    const prose2 = "use claude";
+    overlay.input.onSubmit?.(prose2);
+    await flushAsyncWork();
+    expect(subSessionRecords[0].promptCalls[1].text).toBe(prose2);
+
+    const prose3 = "model this as a state machine";
+    overlay.input.onSubmit?.(prose3);
+    await flushAsyncWork();
+    expect(subSessionRecords[0].promptCalls[2].text).toBe(prose3);
+
+    // /model <query> switches BTW's model override
+    overlay.input.onSubmit?.("/model gpt-5-mini");
+    await flushAsyncWork();
+    expect(overlay.statusText.text).toContain("openai/gpt-5-mini");
+
+    // Bare /model opens model selection inside the overlay
+    overlay.input.onSubmit?.("/model");
+    await flushAsyncWork();
+    expect(overlay.render(90).join("\n")).toContain("openai/gpt-5-mini");
+
+    // Cancel disambiguation and clear override with /model clear
+    overlay.input.onSubmit?.("cancel");
+    await flushAsyncWork();
+    overlay.input.onSubmit?.("/model clear");
+    await flushAsyncWork();
+    expect(overlay.statusText.text).toContain("BTW model override cleared");
+  });
+
+  it("narrows /model and /model <query> to Pi enabledModels settings when configured", async () => {
+    const agentDir = mkdtempSync(path.join(tmpdir(), "btw-enabled-models-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    try {
+      writeFileSync(
+        path.join(agentDir, "settings.json"),
+        JSON.stringify({
+          enabledModels: ["google-vertex/gemini-3.8-flash:high", "github-copilot/gpt-6-*"],
+        }),
+      );
+
+      const harness = createHarness();
+      harness.registerModel("google-vertex", "gemini-3.8-flash", "google-vertex");
+      harness.registerModel("github-copilot", "gpt-6-luna", "github-copilot");
+      harness.registerModel("anthropic", "claude-opus-5-5", "anthropic-messages");
+
+      await harness.runSessionStart();
+      await harness.command("btw", "");
+
+      const overlay = harness.latestOverlayComponent();
+
+      // Bare /model only lists enabled models (excludes anthropic/claude-opus-5-5 and test-provider/test-model)
+      overlay.input.onSubmit?.("/model");
+      await flushAsyncWork();
+      const listed = overlay.render(100).join("\n");
+      expect(listed).toContain("[1] google-vertex/gemini-3.8-flash");
+      expect(listed).toContain("[2] github-copilot/gpt-6-luna");
+      expect(listed).not.toContain("anthropic/claude-opus-5-5");
+      expect(listed).not.toContain("[3]");
+
+      overlay.input.onSubmit?.("cancel");
+      await flushAsyncWork();
+
+      // /model <query> refuses disabled models and resolves enabled ones
+      overlay.input.onSubmit?.("/model claude-opus-5-5");
+      await flushAsyncWork();
+      expect(overlay.statusText.text).toContain("No physical model found matching \"claude-opus-5-5\"");
+
+      overlay.input.onSubmit?.("/model luna");
+      await flushAsyncWork();
+      expect(overlay.statusText.text).toContain("github-copilot/gpt-6-luna");
+    } finally {
+      if (previousAgentDir === undefined) {
+        delete process.env.PI_CODING_AGENT_DIR;
+      } else {
+        process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      }
+      rmSync(agentDir, { recursive: true, force: true });
+    }
+  });
+
+  it("centers the overlay vertically and includes keyless (ADC/IAM) authenticated providers in /model", async () => {
+    const harness = createHarness();
+    harness.registerModel("google-vertex", "gemini-3.8-flash", "google-vertex");
+    harness.registerModel("github-copilot", "gpt-6-luna", "github-copilot");
+    (harness.baseCtx.modelRegistry.getApiKeyAndHeaders as any).mockImplementation(
+      async (m: { provider: string }) =>
+        m.provider === "google-vertex"
+          ? { ok: true, apiKey: undefined, headers: undefined }
+          : { ok: true, apiKey: "copilot-token", headers: undefined },
+    );
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    expect((harness.overlays.at(-1)?.factoryOptions as any)?.overlayOptions).toMatchObject({
+      anchor: "center",
+      margin: { top: 1, bottom: 1, left: 2, right: 2 },
+    });
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onSubmit?.("/model");
+    await flushAsyncWork();
+    const listed = overlay.render(100).join("\n");
+    expect(listed).toContain("google-vertex/gemini-3.8-flash");
+    expect(listed).toContain("github-copilot/gpt-6-luna");
+  });
+
+  it("shows supported thinking levels for the active BTW model with * on the active level and applies selections", async () => {
+    const harness = createHarness();
+    const reasoningModel = {
+      provider: "google-vertex",
+      id: "gemini-3.8-flash",
+      api: "google-vertex",
+      reasoning: true,
+      thinkingLevelMap: { xhigh: null, max: null },
+    };
+    harness.registerModel(reasoningModel);
+    harness.baseCtx.model = reasoningModel as any;
+    harness.setMainThinkingLevel("high");
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+
+    // Bare /thinking opens picker with supported levels and marks active level with *
+    overlay.input.onSubmit?.("/thinking");
+    await flushAsyncWork();
+    const pickerLines = overlay.render(100).join("\n");
+    expect(pickerLines).toContain("Thinking levels for google-vertex/gemini-3.8-flash:");
+    expect(pickerLines).toContain("[1] off");
+    expect(pickerLines).toContain("[2] minimal");
+    expect(pickerLines).toContain("[3] low");
+    expect(pickerLines).toContain("[4] medium");
+    expect(pickerLines).toContain("[5] high *");
+    expect(pickerLines).not.toContain("xhigh");
+    expect(pickerLines).not.toContain("max");
+
+    // Pick by number ([3] -> low)
+    overlay.input.onSubmit?.("3");
+    await flushAsyncWork();
+    expect(overlay.statusText.text).toContain("BTW thinking override set to low.");
+
+    // Re-open /thinking and verify * moved to low
+    overlay.input.onSubmit?.("/thinking");
+    await flushAsyncWork();
+    const updatedPicker = overlay.render(100).join("\n");
+    expect(updatedPicker).toContain("[3] low *");
+    expect(updatedPicker).not.toContain("[5] high *");
+
+    // Cancel picker and reject invalid /thinking argument
+    overlay.input.onSubmit?.("cancel");
+    await flushAsyncWork();
+    overlay.input.onSubmit?.("/thinking bogus");
+    await flushAsyncWork();
+    expect(overlay.statusText.text).toContain('Unsupported thinking level "bogus"');
+  });
+
+  it("clamps xhigh down to high on Google models whose thinkingLevelMap maps xhigh -> xhigh", async () => {
+    const harness = createHarness();
+    const luna = {
+      provider: "github-copilot",
+      id: "gpt-6-luna",
+      api: "openai-responses",
+      reasoning: true,
+      thinkingLevelMap: { xhigh: "xhigh" },
+    };
+    const hydrogen = {
+      provider: "google-vertex",
+      id: "gemini-4-hydrogen",
+      api: "google-vertex",
+      reasoning: true,
+      thinkingLevelMap: {
+        off: null,
+        minimal: null,
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: "xhigh",
+        max: null,
+      },
+    };
+    harness.registerModel(luna);
+    harness.registerModel(hydrogen);
+    harness.baseCtx.model = luna as any;
+    harness.setMainThinkingLevel("xhigh");
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("Luna reply"))
+      .mockImplementationOnce(() => streamAnswer("Hydrogen reply"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first on luna");
+    expect(createAgentSessionMock.mock.calls[0][0].thinkingLevel).toBe("xhigh");
+
+    const overlay = harness.latestOverlayComponent();
+
+    // Switch BTW to google-vertex/gemini-4-hydrogen while main is still on xhigh
+    overlay.input.onSubmit?.("/model gemini-4-hydrogen");
+    await flushAsyncWork();
+
+    // /thinking picker hides xhigh and clamps active marker to high
+    overlay.input.onSubmit?.("/thinking");
+    await flushAsyncWork();
+    const picker = overlay.render(100).join("\n");
+    expect(picker).toContain("[3] high *");
+    expect(picker).not.toContain("xhigh");
+
+    overlay.input.onSubmit?.("cancel");
+    await flushAsyncWork();
+
+    // Reject explicit /thinking xhigh on Google model
+    overlay.input.onSubmit?.("/thinking xhigh");
+    await flushAsyncWork();
+    expect(overlay.statusText.text).toContain('Unsupported thinking level "xhigh"');
+
+    // Submitting a prompt creates the Google sub-session clamped to high (not xhigh)
+    overlay.input.onSubmit?.("second on hydrogen");
+    await flushAsyncWork();
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    expect(createAgentSessionMock.mock.calls[1][0].model.id).toBe("gemini-4-hydrogen");
+    expect(createAgentSessionMock.mock.calls[1][0].thinkingLevel).toBe("high");
   });
 });

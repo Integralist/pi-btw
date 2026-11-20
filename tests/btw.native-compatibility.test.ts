@@ -367,7 +367,7 @@ describe.skipIf(!nativeVirtual)("BTW native 1.2 generic virtual caller contract"
     expect(h.notices.join("\n")).toContain("physical model");
     await h.command("btw", "--model fixture/a --thinking high permitted");
     const count = h.requests.length;
-    h.getOverlay().input.onSubmit("switch to fixture/not-auto");
+    h.getOverlay().input.onSubmit("/model fixture/not-auto");
     await vi.waitFor(() => expect(h.notices.at(-1)).toContain("physical model"));
     expect(h.requests).toHaveLength(count);
     const tool = factories[0].customTools.find((t: any) => t.name === "configure_btw");
@@ -542,7 +542,7 @@ describe.skipIf(!nativeVirtual)("BTW assigned generic virtual caller corrections
     if (caller === "flag") await h.command("btw", "--model fixture/not-auto --thinking high forbidden collision");
     if (caller === "natural") {
       const noticeBefore = h.notices.length;
-      h.getOverlay().input.onSubmit("switch to fixture/not-auto");
+      h.getOverlay().input.onSubmit("/model fixture/not-auto");
       await vi.waitFor(() => expect(h.notices.length).toBeGreaterThan(noticeBefore));
     }
     if (caller === "configure_btw") {
