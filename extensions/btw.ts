@@ -248,7 +248,7 @@ type BtwSessionRuntime = {
 type OverlayRuntime = {
   handle?: OverlayHandle;
   refresh?: () => void;
-  close?: () => void;
+  close?: (options?: { keepSubscriptions?: boolean }) => void;
   finish?: () => void;
   setDraft?: (value: string) => void;
   closed?: boolean;
@@ -2325,6 +2325,7 @@ export default function (pi: ExtensionAPI) {
   let overlayStatus: string | null = null;
   let overlayDraft = "";
   let overlayRuntime: OverlayRuntime | null = null;
+  let overlayHiddenForReopen = false;
   let lastUiContext: ExtensionContext | ExtensionCommandContext | null = null;
   let activeBtwSession: BtwSessionRuntime | null = null;
   let pendingModelDisambiguation: ModelDisambiguationState | null = null;
@@ -2399,6 +2400,10 @@ export default function (pi: ExtensionAPI) {
   function dismissOverlay(): void {
     pendingModelDisambiguation = null;
     pendingThinkingSelection = null;
+    overlayHiddenForReopen = false;
+    if (activeBtwSession) {
+      clearBtwSessionSubscriptions(activeBtwSession);
+    }
     overlayRuntime?.close?.();
     overlayRuntime = null;
   }
@@ -2406,14 +2411,15 @@ export default function (pi: ExtensionAPI) {
   function hideOverlay(): void {
     pendingModelDisambiguation = null;
     pendingThinkingSelection = null;
-    const handle = overlayRuntime?.handle;
-    if (!handle) {
+    if (!overlayRuntime) {
       return;
     }
 
-    handle.setHidden(true);
-    handle.unfocus();
-    overlayRuntime?.refresh?.();
+    // Close the ctx.ui.custom() overlay via done() so Pi decrements uiPromptDepth
+    // and emits ui_prompt_end instead of keeping the UI prompt span open indefinitely.
+    // Keep activeBtwSession subscriptions alive so in-flight turns keep updating state.
+    overlayHiddenForReopen = true;
+    overlayRuntime.close?.({ keepSubscriptions: true });
     releasePendingCommandWaiters();
   }
 
@@ -2437,9 +2443,13 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function toggleOverlayFocus(): void {
+  function toggleOverlayFocus(ctx?: ExtensionContext): void {
     const handle = overlayRuntime?.handle;
     if (!handle) {
+      const targetCtx = ctx ?? lastUiContext;
+      if (overlayHiddenForReopen && targetCtx) {
+        void ensureOverlay(targetCtx);
+      }
       return;
     }
 
@@ -2487,7 +2497,7 @@ export default function (pi: ExtensionAPI) {
     event: AgentSessionEvent,
     ctx?: ExtensionContext | ExtensionCommandContext,
   ): void {
-    if (activeBtwSession?.session !== sessionRuntime.session || !overlayRuntime) {
+    if (activeBtwSession?.session !== sessionRuntime.session) {
       return;
     }
 
@@ -2838,6 +2848,8 @@ export default function (pi: ExtensionAPI) {
     }
     lastUiContext = ctx;
 
+    overlayHiddenForReopen = false;
+
     if (overlayRuntime?.handle) {
       subscribeOverlayToActiveBtwSession(ctx);
       focusOverlay();
@@ -2845,12 +2857,12 @@ export default function (pi: ExtensionAPI) {
     }
 
     const runtime: OverlayRuntime = {};
-    const closeRuntime = () => {
+    const closeRuntime = (options?: { keepSubscriptions?: boolean }) => {
       if (runtime.closed) {
         return;
       }
       runtime.closed = true;
-      if (activeBtwSession) {
+      if (!options?.keepSubscriptions && activeBtwSession) {
         clearBtwSessionSubscriptions(activeBtwSession);
       }
       runtime.handle?.hide();
@@ -2916,10 +2928,10 @@ export default function (pi: ExtensionAPI) {
             overlay.focused = runtime.handle?.isFocused() ?? false;
             overlay.refresh();
           };
-          runtime.close = () => {
+          runtime.close = (options) => {
             overlayDraft = overlay.getDraft();
             overlay.dispose();
-            closeRuntime();
+            closeRuntime(options);
           };
 
           subscribeOverlayToActiveBtwSession(ctx);
@@ -3651,7 +3663,7 @@ export default function (pi: ExtensionAPI) {
           setOverlayStatus("BTW note queued to save after the current turn finishes.", ctx);
         } else {
           setOverlayStatus("Ready for a follow-up.", ctx);
-          if (overlayRuntime?.handle?.isHidden?.()) {
+          if (!overlayRuntime || overlayRuntime.handle?.isHidden?.()) {
             notify(ctx, formatHiddenReplyNotification(ctx.ui.theme), "info");
           }
         }
@@ -3831,8 +3843,8 @@ export default function (pi: ExtensionAPI) {
   for (const shortcut of BTW_FOCUS_SHORTCUTS) {
     pi.registerShortcut(shortcut, {
       description: "Toggle BTW overlay focus while leaving it open.",
-      handler: async (_ctx) => {
-        toggleOverlayFocus();
+      handler: async (ctx) => {
+        toggleOverlayFocus(ctx);
       },
     });
   }
