@@ -73,6 +73,15 @@ Short flags `-m`, `-t`, and `-s` alias `--model`, `--thinking`, and `--save`.
 - **Thinking picker (`/thinking`):** Inside the overlay, `/thinking` lists
   supported levels for the active model with `*` on the active one. Use
   `/thinking <level>` or `/thinking clear` to change it directly.
+- **Context seeding & isolation:** Contextual threads (`/btw`, `/new`) seed an
+  isolated in-memory sub-session from the main branch: they keep the initial
+  goal plus the last 25 messages (aligned to a user turn), strip parent
+  thinking blocks, and cap parent tool outputs at 1,000 characters. Tangent
+  threads (`/tangent`) start with no parent context.
+- **Context management & sync:** BTW turns persist as hidden session entries
+  outside the main agent's context, replay after parent context on reload, and
+  can pull new parent messages anytime with `/sync`. Nothing enters the main
+  agent's context unless you run `/inject` or `/summarize`.
 - **Context & compaction status:** The header shows live BTW context usage (for
   example `2.1% (22k / 1.0M)`), and the status line surfaces threshold and
   overflow compaction progress.
